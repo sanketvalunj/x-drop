@@ -43,9 +43,9 @@ will see you. Settings can be changed later from the menu.
 
 ```
 1. Discover Devices     — live list of online peers on your LAN
-2. Send a File          — pick a peer, pick a file, transfer starts
+2. Send a File          — pick a peer or enter a direct IP/port
 3. Incoming Transfers   — accept / reject offers, view history
-4. Settings             — name, download folder, update check, about
+4. Settings             — name, download folder, diagnostics & health, update check
 5. Quit
 ```
 
@@ -54,13 +54,15 @@ Received files land in `~/projectdropit_files/` by default.
 ## How it works
 
 - **Discovery**: zeroconf broadcasts `<device-name>._projectdropit._tcp.local.`
-  with your TCP port and a `name` TXT record.
-- **Transport**: a fresh TCP socket per session.
+  with your TCP port and a `name` TXT record. If mDNS is blocked by router or
+  firewall, manual Direct IP/Port mode is automatically available as a fallback.
+- **Transport**: a fresh TCP socket per session with bounded concurrency (up to 4 concurrent transfers).
 - **Handshake**: X25519 ECDH → HKDF-SHA256 → 32-byte AES key.
 - **Stream**: each frame is `[12-byte nonce][4-byte length][AES-256-GCM ciphertext]`.
-- **Integrity**: sender streams a SHA-256 of the file; receiver computes its own
-  and compares before marking the transfer complete. Mismatched files are
-  deleted and the transfer fails loudly.
+- **Atomic staging & Integrity**: incoming files are streamed into a temporary `.part` file.
+  Receiver pre-checks available disk storage before accepting. Sender streams a SHA-256
+  of the file; receiver verifies the hash upon completion. Only verified files are atomically
+  promoted to the destination folder; aborted or mismatched files are wiped immediately.
 
 ## Windows firewall
 

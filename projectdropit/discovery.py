@@ -12,7 +12,20 @@ import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from zeroconf import IPVersion, ServiceBrowser, ServiceInfo, ServiceListener, Zeroconf
+try:
+    from zeroconf import IPVersion, ServiceBrowser, ServiceInfo, ServiceListener, Zeroconf
+    HAS_ZEROCONF = True
+except ImportError:
+    HAS_ZEROCONF = False
+    IPVersion = None  # type: ignore
+    ServiceBrowser = None  # type: ignore
+    ServiceInfo = None  # type: ignore
+    ServiceListener = object  # type: ignore
+    Zeroconf = None  # type: ignore
+
+from .logger import get_logger
+
+log = get_logger("discovery")
 
 SERVICE_TYPE = "_projectdropit._tcp.local."
 
@@ -44,6 +57,50 @@ def _primary_ipv4() -> Optional[str]:
         s.close()
 
 
+def parse_peer_endpoint(endpoint: str, default_port: int) -> Optional[Peer]:
+    """Parse a manual IP or IP:port string into a Peer object for direct transfers.
+
+    Supports:
+      - '192.168.1.10' (uses default_port)
+      - '192.168.1.10:54321'
+      - 'localhost:5000'
+    """
+    raw = (endpoint or "").strip()
+    if not raw:
+        return None
+
+    port = default_port
+    if ":" in raw:
+        parts = raw.rsplit(":", 1)
+        addr = parts[0].strip()
+        try:
+            port = int(parts[1])
+            if not (1 <= port <= 65535):
+                return None
+        except ValueError:
+            return None
+    else:
+        addr = raw
+
+    # Validate address
+    try:
+        # Check if valid IPv4 or resolves
+        socket.inet_aton(addr)
+    except socket.error:
+        # Attempt DNS/hostname resolution
+        try:
+            addr = socket.gethostbyname(addr)
+        except Exception:
+            return None
+
+    return Peer(
+        name=f"Direct ({addr}:{port})",
+        service=f"direct-{addr}:{port}",
+        address=addr,
+        port=port,
+    )
+
+
 class _Listener(ServiceListener):
     def __init__(self, peers: Dict[str, Peer], get_self_service, lock: threading.Lock):
         self._peers = peers
@@ -51,27 +108,30 @@ class _Listener(ServiceListener):
         self._lock = lock
 
     def _refresh(self, zc: Zeroconf, type_: str, name: str) -> None:
-        info = zc.get_service_info(type_, name, timeout=1500)
-        if not info:
-            return
-        if name == self._get_self():
-            return  # ignore self (re-evaluated every callback so renames work)
-        addrs = info.parsed_addresses(IPVersion.V4Only) or []
-        if not addrs:
-            return
-        # prefer TXT 'name', fallback to service label
-        txt_name = None
         try:
-            props = info.properties or {}
-            raw = props.get(b"name")
-            if raw:
-                txt_name = raw.decode("utf-8", errors="replace")
-        except Exception:
+            info = zc.get_service_info(type_, name, timeout=1500)
+            if not info:
+                return
+            if name == self._get_self():
+                return  # ignore self
+            addrs = info.parsed_addresses(IPVersion.V4Only) or []
+            if not addrs:
+                return
             txt_name = None
-        display = txt_name or name.split("." + SERVICE_TYPE[:-1].lstrip("_"))[0].rstrip(".")
-        peer = Peer(name=display, service=name, address=addrs[0], port=info.port or 0)
-        with self._lock:
-            self._peers[name] = peer
+            try:
+                props = info.properties or {}
+                raw = props.get(b"name")
+                if raw:
+                    txt_name = raw.decode("utf-8", errors="replace")
+            except Exception:
+                txt_name = None
+            display = txt_name or name.split("." + SERVICE_TYPE[:-1].lstrip("_"))[0].rstrip(".")
+            peer = Peer(name=display, service=name, address=addrs[0], port=info.port or 0)
+            with self._lock:
+                self._peers[name] = peer
+            log.debug(f"Discovered peer {peer.name} @ {peer.endpoint}")
+        except Exception as e:
+            log.warning(f"Error refreshing service {name}: {e}")
 
     def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
         self._refresh(zc, type_, name)
@@ -80,8 +140,13 @@ class _Listener(ServiceListener):
         self._refresh(zc, type_, name)
 
     def remove_service(self, zc: Zeroconf, type_: str, name: str) -> None:
-        with self._lock:
-            self._peers.pop(name, None)
+        try:
+            with self._lock:
+                removed = self._peers.pop(name, None)
+            if removed:
+                log.debug(f"Peer removed: {removed.name} ({name})")
+        except Exception as e:
+            log.warning(f"Error removing service {name}: {e}")
 
 
 class DiscoveryService:
@@ -111,17 +176,26 @@ class DiscoveryService:
     def start(self) -> None:
         ip = _primary_ipv4()
         self.local_ip = ip
+        log.info(f"Starting discovery service. Local IP: {ip}, port: {self.port}")
         addresses = []
         if ip:
             try:
                 addresses = [socket.inet_aton(ip)]
-            except Exception:
+            except Exception as e:
+                log.warning(f"Failed to encode IP {ip}: {e}")
                 addresses = []
+        if not HAS_ZEROCONF:
+            self.last_error = "zeroconf package not installed (mDNS discovery disabled)"
+            log.warning(self.last_error)
+            return
+
         try:
             self._zc = Zeroconf(ip_version=IPVersion.V4Only)
         except Exception as e:
             self.last_error = f"zeroconf init failed: {e}"
+            log.error(f"Zeroconf init failed: {e}")
             return
+
         self._info = ServiceInfo(
             type_=SERVICE_TYPE,
             name=self._service_name,
@@ -133,17 +207,22 @@ class DiscoveryService:
         try:
             self._zc.register_service(self._info)
             self.registered = True
+            log.info(f"mDNS registered service {self._service_name}")
         except Exception as e:
-            # not fatal — discovery may still receive
             self.last_error = f"service register failed: {e}"
+            log.warning(f"mDNS service register failed: {e}")
+
         listener = _Listener(self._peers, lambda: self._service_name, self._lock)
         try:
             self._browser = ServiceBrowser(self._zc, SERVICE_TYPE, listener)
+            log.info(f"mDNS browser started for {SERVICE_TYPE}")
         except Exception as e:
             self.last_error = f"service browse failed: {e}"
+            log.warning(f"mDNS browser failed: {e}")
 
     def update_device_name(self, new_name: str) -> None:
         """Re-register the service under a new human-readable name."""
+        log.info(f"Updating device name to: {new_name}")
         if not self._zc:
             self.device_name = new_name
             self._service_name = self._make_service_name(new_name)
@@ -151,10 +230,9 @@ class DiscoveryService:
         try:
             if self._info:
                 self._zc.unregister_service(self._info)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(f"Unregister on rename: {e}")
         self.device_name = new_name
-        # Drop the stale self-entry from the peer table if zeroconf still has it.
         with self._lock:
             self._peers.pop(self._service_name, None)
         self._service_name = self._make_service_name(new_name)
@@ -170,9 +248,8 @@ class DiscoveryService:
         )
         try:
             self._zc.register_service(self._info)
-        except Exception:
-            pass
-        # Restart the browser so the self-filter uses the new service name.
+        except Exception as e:
+            log.warning(f"Re-registration failed: {e}")
         try:
             if self._browser:
                 self._browser.cancel()
@@ -181,14 +258,28 @@ class DiscoveryService:
         listener = _Listener(self._peers, lambda: self._service_name, self._lock)
         try:
             self._browser = ServiceBrowser(self._zc, SERVICE_TYPE, listener)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"Browser restart failed: {e}")
 
     def peers(self) -> List[Peer]:
         with self._lock:
             return sorted(self._peers.values(), key=lambda p: p.name.lower())
 
+    def diagnostics(self) -> dict:
+        with self._lock:
+            peer_count = len(self._peers)
+        return {
+            "local_ip": self.local_ip,
+            "registered": self.registered,
+            "port": self.port,
+            "service_name": self._service_name,
+            "peer_count": peer_count,
+            "last_error": self.last_error,
+            "zeroconf_active": self._zc is not None,
+        }
+
     def stop(self) -> None:
+        log.info("Stopping discovery service")
         try:
             if self._zc and self._info:
                 self._zc.unregister_service(self._info)

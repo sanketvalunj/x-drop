@@ -9,10 +9,13 @@ Session lifecycle (after `crypto.handshake` completes):
       sender → receiver : JSON {"type":"done","sha256":"<hex>"}
       receiver → sender : JSON {"type":"ack","ok":bool,"reason":"..."}
 
-All control messages are UTF-8 JSON inside a single encrypted frame. File
-content travels as raw bytes inside encrypted frames; the receiver knows the
-total size from the offer, so it stops reading once it has reassembled `size`
-bytes.
+Features & Robustness:
+  - Atomic writing via temporary `.part` file (promoted on SHA-256 success, deleted on any error).
+  - Pre-flight storage validation before accepting transfers.
+  - Graceful cancellation signaling between peers.
+  - Bounded concurrency with Semaphore to prevent resource exhaustion / DoS.
+  - Thread-safe transfer tracking with bounded in-memory history.
+  - Structured rotating file logging for all events.
 """
 from __future__ import annotations
 
@@ -20,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import threading
 import time
@@ -29,11 +33,16 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from .crypto import SecureChannel, handshake
+from .logger import get_logger
+
+log = get_logger("transfer")
 
 CHUNK_SIZE = 64 * 1024
 OFFER_TIMEOUT = 120.0       # seconds the sender waits for accept/reject
 DATA_TIMEOUT = 300.0        # seconds allowed for the full data transfer (5 min)
 SENDER_NAME_MAX = 128       # cap peer-supplied sender name to prevent DoS
+MAX_CONCURRENT_SESSIONS = 4 # maximum simultaneous incoming transfers
+MAX_HISTORY = 100           # maximum retained transfers in memory
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +104,25 @@ def human_size(n: int) -> str:
         if f < 1024.0 or unit == "TB":
             return f"{f:.1f} {unit}" if unit != "B" else f"{int(f)} {unit}"
         f /= 1024.0
-    return f"{n} B"  # unreachable, satisfies type checkers
+    return f"{n} B"
+
+
+def check_disk_space(target_dir: Path, required_bytes: int) -> bool:
+    """Check if target filesystem has enough free storage (+10MB buffer)."""
+    try:
+        usage = shutil.disk_usage(target_dir)
+        return usage.free >= (required_bytes + 10 * 1024 * 1024)
+    except Exception as e:
+        log.warning(f"Could not determine disk usage for {target_dir}: {e}")
+        return True  # fallback: allow if check fails
+
+
+def get_free_disk_space(target_dir: Path) -> int:
+    """Get free disk space in bytes for the specified directory."""
+    try:
+        return shutil.disk_usage(target_dir).free
+    except Exception:
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -107,33 +134,117 @@ STATUS_ACTIVE = "active"
 STATUS_DONE = "done"
 STATUS_REJECTED = "rejected"
 STATUS_FAILED = "failed"
+STATUS_CANCELLED = "cancelled"
 
 
-@dataclass
 class IncomingTransfer:
-    id: str
-    sender_name: str
-    sender_addr: str
-    filename: str
-    size: int
-    started_at: float
-    status: str = STATUS_PENDING
-    received: int = 0
-    save_path: Optional[Path] = None
-    error: Optional[str] = None
-    verified: bool = False
-    finished_at: Optional[float] = None
-    # internal:
-    _decision: threading.Event = field(default_factory=threading.Event, repr=False)
-    _accepted: bool = field(default=False, repr=False)
+    """Represents an incoming transfer with thread-safe property access."""
+
+    def __init__(
+        self,
+        id: str,
+        sender_name: str,
+        sender_addr: str,
+        filename: str,
+        size: int,
+        started_at: float,
+    ):
+        self.id = id
+        self.sender_name = sender_name
+        self.sender_addr = sender_addr
+        self.filename = filename
+        self.size = size
+        self.started_at = started_at
+        self._status = STATUS_PENDING
+        self._received = 0
+        self._save_path: Optional[Path] = None
+        self._temp_path: Optional[Path] = None
+        self._error: Optional[str] = None
+        self._verified = False
+        self._finished_at: Optional[float] = None
+        self._decision = threading.Event()
+        self._accepted = False
+        self._lock = threading.RLock()
+
+    # Thread-safe properties
+    @property
+    def status(self) -> str:
+        with self._lock:
+            return self._status
+
+    @status.setter
+    def status(self, val: str) -> None:
+        with self._lock:
+            self._status = val
+
+    @property
+    def received(self) -> int:
+        with self._lock:
+            return self._received
+
+    @received.setter
+    def received(self, val: int) -> None:
+        with self._lock:
+            self._received = val
+
+    @property
+    def save_path(self) -> Optional[Path]:
+        with self._lock:
+            return self._save_path
+
+    @save_path.setter
+    def save_path(self, val: Optional[Path]) -> None:
+        with self._lock:
+            self._save_path = val
+
+    @property
+    def temp_path(self) -> Optional[Path]:
+        with self._lock:
+            return self._temp_path
+
+    @temp_path.setter
+    def temp_path(self, val: Optional[Path]) -> None:
+        with self._lock:
+            self._temp_path = val
+
+    @property
+    def error(self) -> Optional[str]:
+        with self._lock:
+            return self._error
+
+    @error.setter
+    def error(self, val: Optional[str]) -> None:
+        with self._lock:
+            self._error = val
+
+    @property
+    def verified(self) -> bool:
+        with self._lock:
+            return self._verified
+
+    @verified.setter
+    def verified(self, val: bool) -> None:
+        with self._lock:
+            self._verified = val
+
+    @property
+    def finished_at(self) -> Optional[float]:
+        with self._lock:
+            return self._finished_at
+
+    @finished_at.setter
+    def finished_at(self, val: Optional[float]) -> None:
+        with self._lock:
+            self._finished_at = val
 
     @property
     def speed_bps(self) -> float:
-        if not self.received or not self.started_at:
-            return 0.0
-        end = self.finished_at or time.time()
-        elapsed = max(end - self.started_at, 1e-6)
-        return self.received / elapsed
+        with self._lock:
+            if not self._received or not self.started_at:
+                return 0.0
+            end = self._finished_at or time.time()
+            elapsed = max(end - self.started_at, 1e-6)
+            return self._received / elapsed
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +257,7 @@ def send_file(
     filepath: Path,
     sender_name: str,
     progress: Optional[Callable[[int, int], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> dict:
     """Send `filepath` to peer. Blocking. Returns a result dict.
 
@@ -153,6 +265,7 @@ def send_file(
     """
     filepath = Path(filepath)
     if not filepath.is_file():
+        log.error(f"Send failed: {filepath} is not a valid file")
         return {"ok": False, "reason": f"not a file: {filepath}", "bytes_sent": 0}
     size = filepath.stat().st_size
 
@@ -162,8 +275,10 @@ def send_file(
         sock.connect((peer_addr, peer_port))
     except Exception as e:
         sock.close()
+        log.warning(f"Connect to {peer_addr}:{peer_port} failed: {e}")
         return {"ok": False, "reason": f"connect failed: {e}", "bytes_sent": 0}
 
+    ch: Optional[SecureChannel] = None
     try:
         sock.settimeout(30.0)
         ch = handshake(sock)
@@ -173,21 +288,38 @@ def send_file(
             "filename": filepath.name,
             "size": size,
         })
+        log.info(f"Offered {filepath.name} ({size} bytes) to {peer_addr}:{peer_port}")
+
+        # Wait for receiver decision
         sock.settimeout(OFFER_TIMEOUT)
         resp = _recv_json(ch)
         if resp.get("type") != "response" or not resp.get("accept"):
+            reason = resp.get("reason") or "rejected by peer"
+            log.info(f"Offer for {filepath.name} rejected by peer: {reason}")
             return {
                 "ok": False,
-                "reason": resp.get("reason") or "rejected by peer",
+                "reason": reason,
                 "bytes_sent": 0,
             }
 
-        # Use a generous but finite timeout for the data transfer phase.
+        # Data transfer phase
         sock.settimeout(DATA_TIMEOUT)
         sent = 0
         hasher = hashlib.sha256()
         with filepath.open("rb") as f:
             while sent < size:
+                if cancel_event and cancel_event.is_set():
+                    log.info(f"Send of {filepath.name} cancelled by user")
+                    try:
+                        _send_json(ch, {"type": "cancel", "reason": "cancelled by sender"})
+                    except Exception:
+                        pass
+                    return {
+                        "ok": False,
+                        "reason": "transfer cancelled by user",
+                        "bytes_sent": sent,
+                    }
+
                 chunk = f.read(CHUNK_SIZE)
                 if not chunk:
                     break
@@ -199,21 +331,29 @@ def send_file(
                         progress(sent, size)
                     except Exception:
                         pass
+
         _send_json(ch, {"type": "done", "sha256": hasher.hexdigest()})
-        # best-effort wait for receiver's ack so we know if verification failed
+        log.info(f"Sent all {sent} bytes of {filepath.name}, awaiting acknowledgement")
+
+        # Best-effort wait for receiver's ack
         try:
             sock.settimeout(15.0)
             ack = _recv_json(ch)
             if ack.get("type") == "ack" and ack.get("ok") is False:
+                reason = ack.get("reason") or "receiver verification failed"
+                log.warning(f"Receiver failed verification for {filepath.name}: {reason}")
                 return {
                     "ok": False,
-                    "reason": ack.get("reason") or "receiver verification failed",
+                    "reason": reason,
                     "bytes_sent": sent,
                 }
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"Timed out or failed awaiting ack: {e}")
+
+        log.info(f"Successfully transferred {filepath.name} ({sent} bytes)")
         return {"ok": True, "reason": "", "bytes_sent": sent, "sha256": hasher.hexdigest()}
     except Exception as e:
+        log.error(f"Transfer error for {filepath.name}: {e}")
         return {"ok": False, "reason": f"transfer error: {e}", "bytes_sent": 0}
     finally:
         try:
@@ -242,6 +382,7 @@ class ReceiverServer:
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self.transfers: List[IncomingTransfer] = []
+        self._semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_SESSIONS)
         self.on_offer: Optional[Callable[[IncomingTransfer], None]] = None
         self.on_update: Optional[Callable[[IncomingTransfer], None]] = None
 
@@ -253,17 +394,18 @@ class ReceiverServer:
         s.listen(8)
         self.port = s.getsockname()[1]
         self._sock = s
+        log.info(f"ReceiverServer listening on port {self.port}")
         self._thread = threading.Thread(target=self._accept_loop, name="pdit-accept", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
+        log.info("Stopping ReceiverServer")
         try:
             if self._sock:
                 self._sock.close()
         except Exception:
             pass
-        # Wait briefly for the accept thread to exit cleanly.
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2.0)
 
@@ -287,6 +429,7 @@ class ReceiverServer:
             return False
         t._accepted = accept
         t._decision.set()
+        log.info(f"Transfer {transfer_id} decided: {'accepted' if accept else 'rejected'}")
         return True
 
     # ------------------------------------------------------------------
@@ -297,35 +440,79 @@ class ReceiverServer:
                 conn, addr = self._sock.accept()
             except OSError:
                 break
-            except Exception:
+            except Exception as e:
+                log.warning(f"Error in accept loop: {e}")
                 continue
+
+            # Concurrency limit check
+            if not self._semaphore.acquire(blocking=False):
+                log.warning(f"Connection from {addr} rejected: max concurrent sessions ({MAX_CONCURRENT_SESSIONS}) reached")
+                threading.Thread(
+                    target=self._reject_busy, args=(conn, addr), name="pdit-busy", daemon=True
+                ).start()
+                continue
+
             threading.Thread(
-                target=self._handle, args=(conn, addr), name="pdit-session", daemon=True
+                target=self._handle_wrapper, args=(conn, addr), name="pdit-session", daemon=True
             ).start()
+
+    def _reject_busy(self, conn: socket.socket, addr) -> None:
+        try:
+            conn.settimeout(10.0)
+            ch = handshake(conn)
+            # Drain the offer packet sent by the sender
+            try:
+                _recv_json(ch)
+            except Exception:
+                pass
+            _send_json(ch, {
+                "type": "response",
+                "accept": False,
+                "reason": "server busy: max concurrent transfers reached",
+            })
+            time.sleep(0.05)
+        except Exception as e:
+            log.warning(f"Error sending busy response to {addr}: {e}")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _handle_wrapper(self, conn: socket.socket, addr) -> None:
+        try:
+            self._handle(conn, addr)
+        finally:
+            self._semaphore.release()
 
     def _handle(self, conn: socket.socket, addr) -> None:
         sender_addr = f"{addr[0]}:{addr[1]}"
         t: Optional[IncomingTransfer] = None
+        temp_path: Optional[Path] = None
         try:
             conn.settimeout(30.0)
             ch = handshake(conn)
             offer = _recv_json(ch)
             if offer.get("type") != "offer":
+                log.warning(f"Expected offer message from {sender_addr}, got: {offer.get('type')}")
                 return
 
             filename = sanitize_filename(str(offer.get("filename") or "file.bin"))
 
-            # Validate size: must be a non-negative integer within a sane range.
+            # Validate size
             raw_size = offer.get("size")
             try:
                 size = int(raw_size)
             except (TypeError, ValueError):
+                log.warning(f"Invalid size in offer from {sender_addr}: {raw_size}")
                 return
             if size < 0 or size > 1024 ** 4:  # 1 TB sanity cap
+                log.warning(f"Size out of bounds in offer from {sender_addr}: {size}")
                 return
 
-            # Cap sender name to prevent memory abuse.
             sender_name = str(offer.get("sender") or "unknown")[:SENDER_NAME_MAX]
+            dest_dir = self._get_dir()
+            dest_dir.mkdir(parents=True, exist_ok=True)
 
             t = IncomingTransfer(
                 id=uuid.uuid4().hex[:8],
@@ -335,20 +522,40 @@ class ReceiverServer:
                 size=size,
                 started_at=time.time(),
             )
+
+            # Pre-flight storage check
+            if not check_disk_space(dest_dir, size):
+                free_bytes = get_free_disk_space(dest_dir)
+                reason = f"insufficient storage (needs {human_size(size)}, available {human_size(free_bytes)})"
+                log.warning(f"Rejecting {filename} from {sender_name}: {reason}")
+                t.status = STATUS_FAILED
+                t.error = reason
+                t.finished_at = time.time()
+                with self._lock:
+                    self._add_transfer(t)
+                _send_json(ch, {"type": "response", "accept": False, "reason": reason})
+                if self.on_update:
+                    self.on_update(t)
+                return
+
             with self._lock:
-                self.transfers.append(t)
+                self._add_transfer(t)
+
+            log.info(f"Incoming offer {t.id}: {filename} ({size} bytes) from {sender_name}")
             if self.on_offer:
                 try:
                     self.on_offer(t)
-                except Exception:
-                    pass
+                except Exception as err:
+                    log.error(f"Error in on_offer callback: {err}")
 
-            # wait for decision
+            # Wait for decision
             conn.settimeout(OFFER_TIMEOUT + 5)
             decided = t._decision.wait(timeout=OFFER_TIMEOUT)
             if not decided:
                 t.status = STATUS_REJECTED
                 t.error = "timed out waiting for user decision"
+                t.finished_at = time.time()
+                log.info(f"Transfer {t.id} timed out waiting for decision")
                 try:
                     _send_json(ch, {"type": "response", "accept": False, "reason": "timeout"})
                 except Exception:
@@ -359,6 +566,8 @@ class ReceiverServer:
 
             if not t._accepted:
                 t.status = STATUS_REJECTED
+                t.finished_at = time.time()
+                log.info(f"Transfer {t.id} rejected by user")
                 try:
                     _send_json(ch, {"type": "response", "accept": False, "reason": "rejected"})
                 except Exception:
@@ -367,28 +576,26 @@ class ReceiverServer:
                     self.on_update(t)
                 return
 
-            # accepted — prepare destination
-            dest_dir = self._get_dir()
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            save_path = _unique_path(dest_dir / filename)
-            t.save_path = save_path
+            # Accepted: stage to atomic temporary file (.projectdropit_tmp_<id>.part)
+            temp_path = dest_dir / f".projectdropit_tmp_{t.id}.part"
+            t.temp_path = temp_path
             t.status = STATUS_ACTIVE
             if self.on_update:
                 self.on_update(t)
             _send_json(ch, {"type": "response", "accept": True})
+            log.info(f"Transfer {t.id} accepted. Staging to temporary file {temp_path.name}")
 
-            # Use a generous but finite timeout for the data transfer phase.
+            # Data transfer phase
             conn.settimeout(DATA_TIMEOUT)
             received = 0
             hasher = hashlib.sha256()
-            with save_path.open("wb") as out:
+            with temp_path.open("wb") as out:
                 while received < size:
                     frame = ch.recv()
                     if not frame:
                         continue
                     remaining = size - received
                     if len(frame) > remaining:
-                        # Defensive: protocol shouldn't allow this; trim & stop.
                         frame = frame[:remaining]
                     out.write(frame)
                     hasher.update(frame)
@@ -397,47 +604,47 @@ class ReceiverServer:
                     if self.on_update:
                         self.on_update(t)
 
-            # tail "done" with sha256
+            # Tail "done" with sha256
             expected_sha: Optional[str] = None
             try:
                 conn.settimeout(15.0)
                 tail = _recv_json(ch)
                 if tail.get("type") == "done":
                     expected_sha = tail.get("sha256")
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning(f"Error receiving done frame for {t.id}: {e}")
 
             if received < size:
                 t.status = STATUS_FAILED
                 t.error = f"truncated: got {received}/{size} bytes"
-                # Clean up the incomplete file.
-                try:
-                    save_path.unlink()
-                except Exception:
-                    pass
+                log.error(f"Transfer {t.id} truncated: {received}/{size} bytes")
             elif expected_sha and hasher.hexdigest() != expected_sha:
-                # Delete corrupted file so user is not misled.
-                try:
-                    save_path.unlink()
-                except Exception:
-                    pass
                 t.status = STATUS_FAILED
                 t.error = "integrity check failed (sha256 mismatch)"
+                log.error(f"Transfer {t.id} sha256 mismatch (expected {expected_sha}, computed {hasher.hexdigest()})")
                 try:
                     _send_json(ch, {"type": "ack", "ok": False, "reason": t.error})
                 except Exception:
                     pass
             else:
+                # SUCCESS: Atomically promote .part to final destination path
+                final_path = _unique_path(dest_dir / filename)
+                os.replace(temp_path, final_path)
+                temp_path = None  # Successfully promoted
+                t.save_path = final_path
                 t.status = STATUS_DONE
                 t.verified = bool(expected_sha)
+                log.info(f"Transfer {t.id} verified and saved to {final_path}")
                 try:
                     _send_json(ch, {"type": "ack", "ok": True})
                 except Exception:
                     pass
+
             t.finished_at = time.time()
             if self.on_update:
                 self.on_update(t)
         except Exception as e:
+            log.error(f"Error handling session for {sender_addr}: {e}")
             if t is not None:
                 t.status = STATUS_FAILED
                 t.error = str(e)
@@ -445,10 +652,29 @@ class ReceiverServer:
                 if self.on_update:
                     self.on_update(t)
         finally:
+            # Clean up partial temporary file if it wasn't promoted
+            if temp_path and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                    log.info(f"Cleaned up partial file {temp_path.name}")
+                except Exception as err:
+                    log.warning(f"Failed to clean up partial file {temp_path}: {err}")
             try:
                 conn.close()
             except Exception:
                 pass
+
+    def _add_transfer(self, t: IncomingTransfer) -> None:
+        """Add transfer and cap history to MAX_HISTORY entries (lock must be held)."""
+        if len(self.transfers) >= MAX_HISTORY:
+            # Prune oldest non-pending entry
+            for idx, item in enumerate(self.transfers):
+                if item.status != STATUS_PENDING:
+                    self.transfers.pop(idx)
+                    break
+            else:
+                self.transfers.pop(0)
+        self.transfers.append(t)
 
 
 def _unique_path(p: Path) -> Path:
@@ -460,5 +686,4 @@ def _unique_path(p: Path) -> Path:
         cand = p.with_name(f"{stem} ({i}){suffix}")
         if not cand.exists():
             return cand
-    # Extremely unlikely: fall back to a UUID-based name.
     return p.with_name(f"{stem}_{uuid.uuid4().hex[:8]}{suffix}")

@@ -24,18 +24,23 @@ from tqdm import tqdm
 from . import __version__, updater
 from .branding import APP_NAME, AUTHOR, COPYRIGHT, CREDIT, ORG, TAGLINE
 from .config import Config
-from .discovery import DiscoveryService, Peer, _primary_ipv4
+from .discovery import DiscoveryService, Peer, _primary_ipv4, parse_peer_endpoint
+from .logger import LOG_FILE, get_logger, get_recent_logs, init_logging
 from .transfer import (
+    MAX_CONCURRENT_SESSIONS,
     STATUS_ACTIVE,
+    STATUS_CANCELLED,
     STATUS_DONE,
     STATUS_FAILED,
     STATUS_PENDING,
     STATUS_REJECTED,
     IncomingTransfer,
     ReceiverServer,
+    get_free_disk_space,
     human_size,
     send_file,
 )
+
 
 console = Console()
 
@@ -395,24 +400,42 @@ def _action_discover(disc: DiscoveryService, cfg: Config) -> None:
         stop.set()
 
 
+def _prompt_manual_peer(default_port: int) -> Optional[Peer]:
+    raw_ep = Prompt.ask(
+        "\n[bold]Direct IP[:port][/bold] [dim](e.g. 192.168.1.50 or 192.168.1.50:52341, blank to cancel)[/dim]",
+        default="",
+    ).strip()
+    if not raw_ep:
+        return None
+    peer = parse_peer_endpoint(raw_ep, default_port)
+    if not peer:
+        console.print("[red]Invalid IP address or port format.[/red]")
+        return None
+    return peer
+
+
 def _pick_peer(disc: DiscoveryService, cfg: Config) -> Optional[Peer]:
     # Brief active scan so the user sees results quickly
-    deadline = time.time() + 3.0
+    deadline = time.time() + 2.5
     while time.time() < deadline and not disc.peers():
-        time.sleep(0.3)
+        time.sleep(0.25)
     peers = disc.peers()
     console.print()
     console.print(_peers_table(peers, cfg.device_name))
     if not peers:
         console.print(
-            "[yellow]No peers found yet.[/yellow] "
-            "[dim]Make sure the other device is running [/dim]"
-            "[cyan]projectdropit -start[/cyan][dim] on the same Wi-Fi/LAN.[/dim]"
+            "[yellow]No peers found via auto-discovery.[/yellow]\n"
+            "[dim]Enter [cyan]m[/cyan] to connect directly by IP, or ensure both devices are on the same LAN.[/dim]"
         )
+        raw = Prompt.ask("\n[bold]Option[/bold] [[cyan]m[/cyan] for direct IP / blank to cancel]", default="").strip().lower()
+        if raw in ("m", "manual"):
+            return _prompt_manual_peer(disc.port)
         return None
-    raw = Prompt.ask("\n[bold]Pick a peer[/bold] [#] [dim](blank to cancel)[/dim]", default="")
-    if not raw.strip():
+    raw = Prompt.ask("\n[bold]Pick a peer[/bold] [#] or [cyan]m[/cyan] for direct IP [dim](blank to cancel)[/dim]", default="").strip()
+    if not raw:
         return None
+    if raw.lower() in ("m", "manual"):
+        return _prompt_manual_peer(disc.port)
     try:
         idx = int(raw)
         if not (1 <= idx <= len(peers)):
@@ -470,11 +493,17 @@ def _action_send(disc: DiscoveryService, cfg: Config) -> None:
         bar_holder[0].update(sent - last[0])
         last[0] = sent
 
+    cancel_event = threading.Event()
     result_holder: dict = {}
 
     def runner() -> None:
         result_holder["r"] = send_file(
-            peer.address, peer.port, path, cfg.device_name, progress=progress
+            peer.address,
+            peer.port,
+            path,
+            cfg.device_name,
+            progress=progress,
+            cancel_event=cancel_event,
         )
 
     th = threading.Thread(target=runner, daemon=True)
@@ -483,9 +512,12 @@ def _action_send(disc: DiscoveryService, cfg: Config) -> None:
         while th.is_alive():
             th.join(timeout=0.25)
     except KeyboardInterrupt:
+        cancel_event.set()
         if bar_holder[0] is not None:
             bar_holder[0].close()
-        console.print("\n[yellow]Cancelled by user. Connection will time out on the peer.[/yellow]")
+        console.print("\n[yellow]Cancelling transfer…[/yellow]")
+        th.join(timeout=1.5)
+        console.print("[yellow]Cancelled by user.[/yellow]")
         return
     if bar_holder[0] is not None:
         bar_holder[0].close()
@@ -501,7 +533,7 @@ def _action_send(disc: DiscoveryService, cfg: Config) -> None:
     else:
         reason = (res.get("reason") or "failed").lower()
         if "reject" in reason:
-            console.print("[red]✗ Peer rejected the transfer.[/red]")
+            console.print(f"[red]✗ Peer rejected the transfer:[/red] {res.get('reason')}")
         elif "timeout" in reason or "timed out" in reason:
             console.print("[red]✗ Peer did not respond in time.[/red]")
         elif "connect failed" in reason or "refused" in reason:
@@ -509,6 +541,10 @@ def _action_send(disc: DiscoveryService, cfg: Config) -> None:
                 f"[red]✗ Couldn't connect to {peer.endpoint}.[/red] "
                 "[dim]Peer may have left the network or its firewall blocked the connection.[/dim]"
             )
+        elif "insufficient" in reason or "storage" in reason:
+            console.print(f"[red]✗ Insufficient disk space on peer:[/red] {res.get('reason')}")
+        elif "busy" in reason:
+            console.print(f"[yellow]⚠ Peer is busy:[/yellow] {res.get('reason')}")
         else:
             console.print(f"[red]✗ Transfer failed:[/red] {res.get('reason')}")
 
@@ -566,13 +602,50 @@ def _action_incoming(rx: ReceiverServer) -> None:
             console.print("[red]✗ Rejected.[/red]")
 
 
-def _action_settings(cfg: Config, disc: DiscoveryService, ip: Optional[str], port: int) -> None:
+def _action_diagnostics(cfg: Config, disc: DiscoveryService, rx: ReceiverServer) -> None:
+    diag = disc.diagnostics()
+    free_storage = get_free_disk_space(cfg.download_dir)
+    storage_str = human_size(free_storage)
+    status_color = "green" if diag["registered"] else "yellow"
+    zc_status = "[green]Active[/green]" if diag["zeroconf_active"] else "[red]Inactive[/red]"
+    active_rx = len([t for t in rx.transfers if t.status == STATUS_ACTIVE])
+
+    console.print()
+    console.print(Panel(
+        Text.from_markup(
+            f"[bold]Local IP Address :[/bold] [cyan]{diag['local_ip'] or 'None detected'}[/cyan]\n"
+            f"[bold]Listening Port   :[/bold] [cyan]{rx.port}[/cyan]\n"
+            f"[bold]Active Sessions  :[/bold] {active_rx}/{MAX_CONCURRENT_SESSIONS}\n"
+            f"[bold]mDNS Discovery   :[/bold] {zc_status} (registered: [{status_color}]{diag['registered']}[/{status_color}])\n"
+            f"[bold]Online Peers     :[/bold] {diag['peer_count']}\n"
+            f"[bold]Storage Free     :[/bold] {storage_str} [dim]in {cfg.download_dir}[/dim]\n"
+            f"[bold]Log File Path    :[/bold] [dim]{LOG_FILE}[/dim]"
+            + (f"\n[bold red]Last mDNS Error  :[/bold red] {diag['last_error']}" if diag['last_error'] else "")
+        ),
+        title="🛠  Diagnostics & System Health",
+        title_align="left",
+        border_style="cyan",
+        box=ROUNDED,
+    ))
+
+    recent = get_recent_logs(15)
+    if recent:
+        console.print("\n[bold]Recent Diagnostics / Log Events:[/bold]")
+        for line in recent[-10:]:
+            console.print(f"[dim]{line}[/dim]")
+    else:
+        console.print("\n[dim]No log events recorded yet.[/dim]")
+
+    _press_enter()
+
+
+def _action_settings(cfg: Config, disc: DiscoveryService, rx: ReceiverServer, ip: Optional[str]) -> None:
     while True:
         console.print()
         console.print(Panel(
             Text.from_markup(
                 f"[bold]Device name      [/bold] {cfg.device_name}\n"
-                f"[bold]LAN address      [/bold] {ip or '—'}:{port}\n"
+                f"[bold]LAN address      [/bold] {ip or '—'}:{rx.port}\n"
                 f"[bold]Download folder  [/bold] {cfg.download_dir}\n"
                 f"[bold]Encryption       [/bold] [green]ECDH (X25519) + AES-256-GCM[/green]\n"
                 f"[bold]Version          [/bold] {__version__}"
@@ -586,10 +659,11 @@ def _action_settings(cfg: Config, disc: DiscoveryService, ip: Optional[str], por
             "  [bold cyan]1[/bold cyan]  Change device name\n"
             "  [bold cyan]2[/bold cyan]  Change download folder\n"
             "  [bold cyan]3[/bold cyan]  Check for updates\n"
-            "  [bold cyan]4[/bold cyan]  About\n"
-            "  [bold cyan]5[/bold cyan]  Back"
+            "  [bold cyan]4[/bold cyan]  Diagnostics & System Health\n"
+            "  [bold cyan]5[/bold cyan]  About\n"
+            "  [bold cyan]6[/bold cyan]  Back"
         )
-        choice = Prompt.ask("›", choices=["1", "2", "3", "4", "5"], default="5")
+        choice = Prompt.ask("›", choices=["1", "2", "3", "4", "5", "6"], default="6")
         if choice == "1":
             new_name = Prompt.ask("New device name", default=cfg.device_name).strip()
             if new_name and new_name != cfg.device_name:
@@ -640,6 +714,8 @@ def _action_settings(cfg: Config, disc: DiscoveryService, ip: Optional[str], por
                         f"[dim](v{__version__})[/dim]."
                     )
         elif choice == "4":
+            _action_diagnostics(cfg, disc, rx)
+        elif choice == "5":
             console.print(Panel(
                 Text.from_markup(
                     f"[bold cyan]{APP_NAME}[/bold cyan]  v{__version__}\n"
@@ -663,6 +739,7 @@ def _action_settings(cfg: Config, disc: DiscoveryService, ip: Optional[str], por
 # =============================================================================
 
 def main() -> None:
+    init_logging()
     flags = _parse_args()
     cfg = Config.load()
 
@@ -774,7 +851,7 @@ def main() -> None:
             elif choice == "3":
                 _action_incoming(rx)
             elif choice == "4":
-                _action_settings(cfg, disc, ip, rx.port)
+                _action_settings(cfg, disc, rx, ip)
             elif choice == "5":
                 if Confirm.ask("Quit projectdropit?", default=True):
                     break
