@@ -1,4 +1,4 @@
-"""Thread-safe rotating file and memory-buffered logger for xdrop.
+"""Logging layer: keep rotating diagnostic logs and a recent in-memory log buffer.
 
 Ensures all background services (Zeroconf, ReceiverServer, Updater, TCP sessions)
 have detailed diagnostic logs without polluting stdout or breaking the Rich TUI.

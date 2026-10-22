@@ -1,4 +1,6 @@
-"""Regression test for a real bug: the old receiver loop misclassified any
+"""Regression check for receiving small JSON files without truncation.
+
+The old receiver loop misclassified any
 encrypted frame that started with b'{' and was < 256 bytes as the protocol
 'done' control message, which would silently truncate small JSON files.
 """

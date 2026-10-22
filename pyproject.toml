@@ -1,3 +1,4 @@
+# Build, package, runtime dependency, and command metadata for xdrop.
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -5,7 +6,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "xdrop"
 version = "1.0.5"
-description = "Menu-driven peer-to-peer encrypted file transfer for your LAN. No server, no admin, no setup."
+description = "Encrypted peer-to-peer file transfer for your LAN, with a terminal and local web interface."
 readme = "README.md"
 requires-python = ">=3.8"
 license = "MIT"
@@ -48,9 +49,13 @@ Homepage = "https://pypi.org/project/xdrop/"
 
 [project.scripts]
 xdrop = "xdrop.cli:main"
+xdrop-web = "xdrop.web:main"
 
 [tool.setuptools.packages.find]
 include = ["xdrop*"]
+
+[tool.setuptools.package-data]
+xdrop = ["static/*.html", "static/*.css", "static/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,4 +1,4 @@
-"""Shared pytest configuration for xdrop tests."""
+"""Test setup: make the repository package importable during pytest runs."""
 from __future__ import annotations
 
 import sys

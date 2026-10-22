@@ -1,4 +1,4 @@
-"""Unit tests for xdrop.transfer.sanitize_filename.
+"""Filename safety checks for xdrop.transfer.sanitize_filename.
 
 Covers the cross-OS path-traversal and reserved-name protections.
 """

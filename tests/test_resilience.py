@@ -1,4 +1,4 @@
-"""Resilience, fault-isolation, and error fallback tests for xdrop.
+"""Reliability checks: exercise xdrop's error handling and fallback behavior.
 
 Covers:
   - Direct IP/Port endpoint parsing (manual connect fallback)
@@ -6,7 +6,7 @@ Covers:
   - User cancellation signaling and instant teardown
   - Pre-flight storage rejection
   - Concurrency bounding / server busy rejection
-  - Non-dropit connection handling (fuzzing / port scanning)
+  - Unrecognized connection handling (fuzzing / port scanning)
   - Diagnostic and logging subsystems
 """
 from __future__ import annotations

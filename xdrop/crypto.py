@@ -1,4 +1,6 @@
-"""ECDH (X25519) handshake + AES-256-GCM streaming framing.
+"""Secure transport layer: agree on a session key and encrypt framed messages.
+
+ECDH (X25519) handshake + AES-256-GCM streaming framing.
 
 Wire format after handshake — every frame is:
     [12 bytes nonce][4 bytes big-endian ciphertext length][ciphertext]

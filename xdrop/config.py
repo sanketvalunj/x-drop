@@ -1,4 +1,7 @@
-"""Persistent user settings stored at ~/.xdrop/config.json."""
+"""Settings layer: load, validate, and save the user's xdrop configuration.
+
+Settings live in ~/.xdrop/config.json; received files default to ~/xdrop_files.
+"""
 from __future__ import annotations
 
 import json

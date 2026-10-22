@@ -1,4 +1,6 @@
-"""Loopback smoke test: spin up a ReceiverServer, push a file through `send_file`,
+"""Transfer integration check: send a file through a local ReceiverServer.
+
+Spin up a ReceiverServer, push a file through `send_file`,
 auto-accept the offer, and verify byte-for-byte equality.
 
 Run:  python -m tests.test_loopback

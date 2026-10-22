@@ -1,4 +1,5 @@
 #!/bin/sh
+# Clear xdrop's local Python bytecode caches and launch it from this checkout.
 set -eu
 
 PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

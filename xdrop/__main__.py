@@ -1,3 +1,5 @@
+"""Module entry point: start the interactive xdrop command-line app."""
+
 from .cli import main
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Unit tests for xdrop.updater.
+"""Update-check behavior checks for xdrop.updater.
 
 Tests are fully offline — _fetch_latest is monkey-patched so no real
 network requests are made.

@@ -1,4 +1,6 @@
-"""Transfer protocol on top of the encrypted channel.
+"""File-transfer layer: send offers, stream encrypted file data, and verify results.
+
+Transfer protocol on top of the encrypted channel.
 
 Session lifecycle (after `crypto.handshake` completes):
 

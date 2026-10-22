@@ -4,7 +4,7 @@
 
 # XDROP
 
-> A menu-driven peer-to-peer encrypted file transfer CLI for your local network.
+> Peer-to-peer encrypted file sharing for your local network, with a terminal and a clean web dashboard.
 
 - 🛰  **Auto-discovery** on the LAN (zeroconf / mDNS)
 - 🔒 **End-to-end encryption** every session — X25519 ECDH + AES-256-GCM
@@ -35,6 +35,16 @@ xdrop -start
 ```
 
 (`xdrop`, `xdrop start`, and `xdrop --start` all work too.)
+
+To open the web dashboard instead, run:
+
+```bash
+xdrop-web
+```
+
+It opens at `http://127.0.0.1:8765` and is only available on the computer
+running xdrop. The dashboard can discover devices, send files, manage incoming
+requests, and change the device name and download folder.
 
 On first launch you must enter a device name — that's how others on the LAN
 will see you. Settings can be changed later from the menu.

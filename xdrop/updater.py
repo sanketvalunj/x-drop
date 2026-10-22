@@ -1,4 +1,4 @@
-"""Background PyPI update check.
+"""Update-check layer: compare the installed version with PyPI in the background.
 
 Two entry points:
 - ``check_async()``  — fire-and-forget daemon thread (used at startup).

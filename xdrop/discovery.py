@@ -1,4 +1,6 @@
-"""LAN discovery via zeroconf (mDNS).
+"""Peer discovery layer: find xdrop devices on a LAN and parse direct endpoints.
+
+LAN discovery via zeroconf (mDNS).
 
 Each device advertises a service of type ``_xdrop._tcp.local.`` with
 the listening TCP port and a ``name`` TXT record. A background listener keeps

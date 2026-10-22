@@ -1,4 +1,8 @@
-"""Rich-styled menu-driven CLI for xdrop."""
+"""Application interface: parse command-line options and run xdrop's interactive menus.
+
+This module connects configuration, discovery, encrypted transfers, diagnostics,
+and update checks to the user-facing terminal interface.
+"""
 from __future__ import annotations
 
 import os
