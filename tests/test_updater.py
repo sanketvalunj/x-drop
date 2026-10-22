@@ -1,4 +1,4 @@
-"""Unit tests for projectdropit.updater.
+"""Unit tests for xdrop.updater.
 
 Tests are fully offline — _fetch_latest is monkey-patched so no real
 network requests are made.
@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import projectdropit.updater as updater
+import xdrop.updater as updater
 
 
 def _reset():

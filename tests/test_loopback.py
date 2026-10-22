@@ -16,7 +16,7 @@ from pathlib import Path
 # Allow running from repo root without install.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from projectdropit.transfer import (  # noqa: E402
+from xdrop.transfer import (  # noqa: E402
     STATUS_DONE,
     ReceiverServer,
     send_file,

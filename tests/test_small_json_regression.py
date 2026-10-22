@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from projectdropit.transfer import STATUS_DONE, ReceiverServer, send_file
+from xdrop.transfer import STATUS_DONE, ReceiverServer, send_file
 
 
 def main() -> int:

@@ -1,6 +1,6 @@
 """LAN discovery via zeroconf (mDNS).
 
-Each device advertises a service of type ``_projectdropit._tcp.local.`` with
+Each device advertises a service of type ``_xdrop._tcp.local.`` with
 the listening TCP port and a ``name`` TXT record. A background listener keeps
 a live dict of currently-online peers.
 """
@@ -27,7 +27,7 @@ from .logger import get_logger
 
 log = get_logger("discovery")
 
-SERVICE_TYPE = "_projectdropit._tcp.local."
+SERVICE_TYPE = "_xdrop._tcp.local."
 
 
 @dataclass

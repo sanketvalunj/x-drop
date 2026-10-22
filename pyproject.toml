@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "projectdropit"
+name = "xdrop"
 version = "1.0.5"
 description = "Menu-driven peer-to-peer encrypted file transfer for your LAN. No server, no admin, no setup."
 readme = "README.md"
@@ -11,11 +11,10 @@ requires-python = ">=3.8"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [
-  { name = "roshhellwett" },
-  { name = "Zenith Open Source Projects" },
+  { name = "Sanket Valunj" },
 ]
 maintainers = [
-  { name = "roshhellwett" },
+  { name = "Sanket Valunj" },
 ]
 keywords = ["lan", "p2p", "file-transfer", "zeroconf", "mdns", "cli", "encryption"]
 classifiers = [
@@ -45,17 +44,13 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://pypi.org/project/projectdropit/"
-Source = "https://github.com/roshhellwett/projectdropit"
-Issues = "https://github.com/roshhellwett/projectdropit/issues"
-Changelog = "https://github.com/roshhellwett/projectdropit/blob/main/CHANGELOG.md"
-Organization = "https://github.com/zenith-open-source"
+Homepage = "https://pypi.org/project/xdrop/"
 
 [project.scripts]
-projectdropit = "projectdropit.cli:main"
+xdrop = "xdrop.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["projectdropit*"]
+include = ["xdrop*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

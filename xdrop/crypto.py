@@ -70,7 +70,7 @@ def _derive_key(shared_secret: bytes) -> bytes:
         algorithm=hashes.SHA256(),
         length=32,
         salt=None,
-        info=b"projectdropit/v1/aes-256-gcm",
+        info=b"xdrop/v1/aes-256-gcm",
     ).derive(shared_secret)
 
 
@@ -91,7 +91,7 @@ def handshake(sock: socket.socket) -> SecureChannel:
     # read peer hello
     hello = _recv_exact(sock, HANDSHAKE_LEN)
     if hello[: len(MAGIC)] != MAGIC:
-        raise ValueError("peer is not a projectdropit instance")
+        raise ValueError("peer is not a xdrop instance")
     if hello[len(MAGIC)] != VERSION:
         raise ValueError(f"unsupported protocol version: {hello[len(MAGIC)]}")
     peer_pub = X25519PublicKey.from_public_bytes(hello[len(MAGIC) + 1 :])

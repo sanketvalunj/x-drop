@@ -1,4 +1,4 @@
-"""Resilience, fault-isolation, and error fallback tests for projectdropit.
+"""Resilience, fault-isolation, and error fallback tests for xdrop.
 
 Covers:
   - Direct IP/Port endpoint parsing (manual connect fallback)
@@ -22,9 +22,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from projectdropit.discovery import DiscoveryService, parse_peer_endpoint
-from projectdropit.logger import get_recent_logs, init_logging
-from projectdropit.transfer import (
+from xdrop.discovery import DiscoveryService, parse_peer_endpoint
+from xdrop.logger import get_recent_logs, init_logging
+from xdrop.transfer import (
     MAX_CONCURRENT_SESSIONS,
     STATUS_DONE,
     STATUS_FAILED,
@@ -135,7 +135,7 @@ def test_storage_preflight_rejection():
     rx.start()
 
     # Mock check_disk_space to return False
-    with patch("projectdropit.transfer.check_disk_space", return_value=False):
+    with patch("xdrop.transfer.check_disk_space", return_value=False):
         result = send_file(
             peer_addr="127.0.0.1",
             peer_port=rx.port,
@@ -258,7 +258,7 @@ def test_concurrency_saturation_rejection():
 
 def test_zeroconf_missing_fallback():
     """Verify DiscoveryService gracefully degrades when zeroconf library is unavailable."""
-    with patch("projectdropit.discovery.HAS_ZEROCONF", False):
+    with patch("xdrop.discovery.HAS_ZEROCONF", False):
         disc = DiscoveryService("fallback_node", 54321)
         disc.start()
 

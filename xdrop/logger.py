@@ -1,4 +1,4 @@
-"""Thread-safe rotating file and memory-buffered logger for projectdropit.
+"""Thread-safe rotating file and memory-buffered logger for xdrop.
 
 Ensures all background services (Zeroconf, ReceiverServer, Updater, TCP sessions)
 have detailed diagnostic logs without polluting stdout or breaking the Rich TUI.
@@ -51,7 +51,7 @@ def init_logging(level: int = logging.INFO) -> None:
     except Exception:
         pass
 
-    logger = logging.getLogger("projectdropit")
+    logger = logging.getLogger("xdrop")
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
 
@@ -82,14 +82,14 @@ def init_logging(level: int = logging.INFO) -> None:
         pass
 
     _initialized = True
-    logger.info("projectdropit logging initialized")
+    logger.info("xdrop logging initialized")
 
 
 def get_logger(name: str) -> logging.Logger:
-    """Get a namespaced logger under projectdropit."""
+    """Get a namespaced logger under xdrop."""
     if not _initialized:
         init_logging()
-    return logging.getLogger(f"projectdropit.{name}")
+    return logging.getLogger(f"xdrop.{name}")
 
 
 def get_recent_logs(count: int = 50) -> List[str]:

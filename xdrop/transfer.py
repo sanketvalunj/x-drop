@@ -576,8 +576,8 @@ class ReceiverServer:
                     self.on_update(t)
                 return
 
-            # Accepted: stage to atomic temporary file (.projectdropit_tmp_<id>.part)
-            temp_path = dest_dir / f".projectdropit_tmp_{t.id}.part"
+            # Accepted: stage to atomic temporary file (.xdrop_tmp_<id>.part)
+            temp_path = dest_dir / f".xdrop_tmp_{t.id}.part"
             t.temp_path = temp_path
             t.status = STATUS_ACTIVE
             if self.on_update:

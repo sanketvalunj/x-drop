@@ -21,7 +21,7 @@ from typing import Optional, Tuple
 
 from . import __version__
 
-_PYPI_URL = "https://pypi.org/pypi/projectdropit/json"
+_PYPI_URL = "https://pypi.org/pypi/xdrop/json"
 _ASYNC_TIMEOUT_S = 5.0   # network timeout for the background startup check
 _SYNC_TIMEOUT_S  = 8.0   # network timeout for the manual (blocking) check
 
@@ -62,7 +62,7 @@ def _fetch_latest(timeout: float) -> Tuple[Optional[str], Optional[str]]:
     try:
         req = urllib.request.Request(
             _PYPI_URL,
-            headers={"User-Agent": f"projectdropit/{__version__} (update-check)"},
+            headers={"User-Agent": f"xdrop/{__version__} (update-check)"},
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))

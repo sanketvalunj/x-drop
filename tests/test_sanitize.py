@@ -1,4 +1,4 @@
-"""Unit tests for projectdropit.transfer.sanitize_filename.
+"""Unit tests for xdrop.transfer.sanitize_filename.
 
 Covers the cross-OS path-traversal and reserved-name protections.
 """
@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from projectdropit.transfer import sanitize_filename
+from xdrop.transfer import sanitize_filename
 
 
 CASES = [

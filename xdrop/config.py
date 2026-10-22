@@ -1,4 +1,4 @@
-"""Persistent user settings stored at ~/.projectdropit/config.json."""
+"""Persistent user settings stored at ~/.xdrop/config.json."""
 from __future__ import annotations
 
 import json
@@ -7,11 +7,11 @@ import socket
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-CONFIG_DIR = Path.home() / ".projectdropit"
+CONFIG_DIR = Path.home() / ".xdrop"
 CONFIG_PATH = CONFIG_DIR / "config.json"
-# IMPORTANT: must NOT be ~/projectdropit — that would shadow the package name
+# IMPORTANT: must NOT be ~/xdrop — that would shadow the package name
 # when Python is run from the home directory ('' in sys.path resolves to ~/).
-DEFAULT_DOWNLOAD_DIR = Path.home() / "projectdropit_files"
+DEFAULT_DOWNLOAD_DIR = Path.home() / "xdrop_files"
 
 
 def _default_device_name() -> str:
@@ -105,14 +105,14 @@ class Config:
 
     @staticmethod
     def migrate_legacy_download_dir() -> Optional[str]:
-        """Rename ~/projectdropit → ~/projectdropit_files if it exists and is not
+        """Rename ~/xdrop → ~/xdrop_files if it exists and is not
         already the new default. Returns a message if migration happened, else None.
 
         This is a one-time migration for users who had the old default.
         The old directory name shadowed the package when Python was run from ~.
         """
-        old = Path.home() / "projectdropit"
-        new = Path.home() / "projectdropit_files"
+        old = Path.home() / "xdrop"
+        new = Path.home() / "xdrop_files"
         if old.exists() and old.is_dir() and not new.exists():
             try:
                 old.rename(new)

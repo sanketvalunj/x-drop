@@ -1,4 +1,4 @@
-"""Rich-styled menu-driven CLI for projectdropit."""
+"""Rich-styled menu-driven CLI for xdrop."""
 from __future__ import annotations
 
 import os
@@ -22,7 +22,7 @@ from rich.text import Text
 from tqdm import tqdm
 
 from . import __version__, updater
-from .branding import APP_NAME, AUTHOR, COPYRIGHT, CREDIT, ORG, TAGLINE
+from .branding import APP_NAME, AUTHOR, COPYRIGHT, CREDIT, TAGLINE
 from .config import Config
 from .discovery import DiscoveryService, Peer, _primary_ipv4, parse_peer_endpoint
 from .logger import LOG_FILE, get_logger, get_recent_logs, init_logging
@@ -54,11 +54,11 @@ def _print_help() -> None:
         f"\n[bold cyan]{APP_NAME}[/bold cyan]  [dim]v{__version__}[/dim]\n"
         f"{TAGLINE}\n\n"
         "[bold]Usage:[/bold]\n"
-        "  [cyan]projectdropit[/cyan]            launch the interactive menu\n"
-        "  [cyan]projectdropit -start[/cyan]     same as above\n"
-        "  [cyan]projectdropit --version[/cyan]  print version and exit\n"
-        "  [cyan]projectdropit --no-update[/cyan]  skip update check on launch\n"
-        "  [cyan]projectdropit -h[/cyan]         show this help\n"
+        "  [cyan]xdrop[/cyan]            launch the interactive menu\n"
+        "  [cyan]xdrop -start[/cyan]     same as above\n"
+        "  [cyan]xdrop --version[/cyan]  print version and exit\n"
+        "  [cyan]xdrop --no-update[/cyan]  skip update check on launch\n"
+        "  [cyan]xdrop -h[/cyan]         show this help\n"
     )
 
 
@@ -85,7 +85,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> dict:
         elif a in ("--no-update", "-no-update"):
             flags["check_updates"] = False
         else:
-            console.print(f"[red]Unknown argument:[/red] {args[i]}   (try [cyan]projectdropit -h[/cyan])")
+            console.print(f"[red]Unknown argument:[/red] {args[i]}   (try [cyan]xdrop -h[/cyan])")
             sys.exit(2)
         i += 1
     return flags
@@ -180,24 +180,24 @@ def _show_update_banner(latest: str) -> None:
         Text.from_markup(
             f"[bold green]Update available[/bold green]: "
             f"[red]{__version__}[/red] → [bold green]{latest}[/bold green]\n"
-            f"[dim]Run:[/dim] [cyan]pip install -U projectdropit[/cyan]"
+            f"[dim]Run:[/dim] [cyan]pip install -U xdrop[/cyan]"
         ),
         border_style="green",
         box=ROUNDED,
-        title="✨ projectdropit",
+        title="✨ xdrop",
         title_align="left",
     ))
 
 
 def _run_pip_upgrade() -> None:
-    cmd = [sys.executable, "-m", "pip", "install", "-U", "projectdropit"]
+    cmd = [sys.executable, "-m", "pip", "install", "-U", "xdrop"]
     console.print(f"[dim]$ {' '.join(shlex.quote(c) for c in cmd)}[/dim]")
     try:
         result = subprocess.run(cmd, timeout=120)
         rc = result.returncode
     except subprocess.TimeoutExpired:
         console.print("[red]Update timed out after 2 minutes.[/red] Try manually:")
-        console.print("[cyan]pip install -U projectdropit[/cyan]")
+        console.print("[cyan]pip install -U xdrop[/cyan]")
         return
     except Exception as e:
         console.print(f"[red]Update failed:[/red] {e}")
@@ -206,12 +206,12 @@ def _run_pip_upgrade() -> None:
         console.print(
             "[green]✓ Updated successfully.[/green] "
             "Restart the app to use the new version: "
-            "[cyan]projectdropit -start[/cyan]"
+            "[cyan]xdrop -start[/cyan]"
         )
         # Raise a dedicated exception so main()'s finally block can suppress
         # the generic "Shutting down…" message that would otherwise appear.
         raise _UpdatedAndExit()
-    console.print(f"[red]Update exited with code {rc}.[/red] Try manually: [cyan]pip install -U projectdropit[/cyan]")
+    console.print(f"[red]Update exited with code {rc}.[/red] Try manually: [cyan]pip install -U xdrop[/cyan]")
 
 
 class _UpdatedAndExit(SystemExit):
@@ -721,7 +721,6 @@ def _action_settings(cfg: Config, disc: DiscoveryService, rx: ReceiverServer, ip
                     f"[bold cyan]{APP_NAME}[/bold cyan]  v{__version__}\n"
                     f"{TAGLINE}\n\n"
                     f"[dim]Author:[/dim] {AUTHOR}\n"
-                    f"[dim]Org:[/dim] {ORG}\n"
                     f"[dim]License:[/dim] MIT\n"
                     f"[dim]{COPYRIGHT}[/dim]"
                 ),
@@ -743,7 +742,7 @@ def main() -> None:
     flags = _parse_args()
     cfg = Config.load()
 
-    # One-time migration: ~/projectdropit → ~/projectdropit_files
+    # One-time migration: ~/xdrop → ~/xdrop_files
     # The old name shadowed the package when Python ran from the home directory.
     migration_msg = Config.migrate_legacy_download_dir()
     if migration_msg:
@@ -853,7 +852,7 @@ def main() -> None:
             elif choice == "4":
                 _action_settings(cfg, disc, rx, ip)
             elif choice == "5":
-                if Confirm.ask("Quit projectdropit?", default=True):
+                if Confirm.ask("Quit xdrop?", default=True):
                     break
     except KeyboardInterrupt:
         console.print()

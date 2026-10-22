@@ -1,4 +1,4 @@
-"""Shared pytest configuration for projectdropit tests."""
+"""Shared pytest configuration for xdrop tests."""
 from __future__ import annotations
 
 import sys
