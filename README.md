@@ -2,7 +2,7 @@
 [![license](https://img.shields.io/badge/license-MIT-green)](#)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)](#)
 
-# PROJECTDROPIT
+# XDROP
 
 > A menu-driven peer-to-peer encrypted file transfer CLI for your local network.
 
@@ -19,7 +19,7 @@
 ## Install
 
 ```bash
-pip install projectdropit
+pip install xdrop
 ```
 
 Or from source:
@@ -31,10 +31,10 @@ pip install .
 ## Run
 
 ```bash
-projectdropit -start
+xdrop -start
 ```
 
-(`projectdropit`, `projectdropit start`, and `projectdropit --start` all work too.)
+(`xdrop`, `xdrop start`, and `xdrop --start` all work too.)
 
 On first launch you must enter a device name — that's how others on the LAN
 will see you. Settings can be changed later from the menu.
@@ -49,11 +49,11 @@ will see you. Settings can be changed later from the menu.
 5. Quit
 ```
 
-Received files land in `~/projectdropit_files/` by default.
+Received files land in `~/xdrop_files/` by default.
 
 ## How it works
 
-- **Discovery**: zeroconf broadcasts `<device-name>._projectdropit._tcp.local.`
+- **Discovery**: zeroconf broadcasts `<device-name>._xdrop._tcp.local.`
   with your TCP port and a `name` TXT record. If mDNS is blocked by router or
   firewall, manual Direct IP/Port mode is automatically available as a fallback.
 - **Transport**: a fresh TCP socket per session with bounded concurrency (up to 4 concurrent transfers).
@@ -66,7 +66,7 @@ Received files land in `~/projectdropit_files/` by default.
 
 ## Windows firewall
 
-The first time you run `projectdropit`, Windows shows the standard
+The first time you run `xdrop`, Windows shows the standard
 "Allow an app to communicate" dialog. Click **Allow** on private networks.
 **No admin password is ever required.** The app prints a friendly heads-up
 before opening its socket.
@@ -87,4 +87,5 @@ No pre-shared passwords. No cloud.
 
 ---
 
-© 2026 [Zenith Open Source Projects](https://zenithopensourceprojects.vercel.app/). All Rights Reserved. Zenith is an Open Source Project Idea by @roshhellwett
+© 2026 Sanket Valunj. All Rights Reserved.
+# x-drop
