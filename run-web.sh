@@ -9,4 +9,8 @@ find xdrop -type d -name __pycache__ -prune -exec rm -rf {} +
 find xdrop -type f -name '*.py[co]' -delete
 
 export PYTHONDONTWRITEBYTECODE=1
-exec python3 -m xdrop.web "$@"
+PYTHON="$PROJECT_DIR/.venv/bin/python"
+if [ ! -x "$PYTHON" ]; then
+  PYTHON=python3
+fi
+exec "$PYTHON" -m xdrop.web "$@"

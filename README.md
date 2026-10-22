@@ -44,7 +44,11 @@ xdrop-web
 
 It opens at `http://127.0.0.1:8765` and is only available on the computer
 running xdrop. The dashboard can discover devices, send files, manage incoming
-requests, and change the device name and download folder.
+requests, show live outgoing transfer progress with cancellation, accept drag-and-drop
+file selection, send multiple files one by one, show a QR code for this device's
+address, connect by IP, search and filter transfer history, clear completed history,
+copy this device's address and port, open the download folder, and change the device
+name and download location.
 
 On first launch you must enter a device name — that's how others on the LAN
 will see you. Settings can be changed later from the menu.

@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -14,9 +17,16 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
 from .config import Config
-from .discovery import DiscoveryService, _primary_ipv4
+from .discovery import DiscoveryService, _primary_ipv4, parse_peer_endpoint
 from .logger import init_logging
 from .transfer import IncomingTransfer, ReceiverServer, sanitize_filename, send_file
+
+try:
+    import qrcode
+    HAS_QR = True
+except ImportError:
+    qrcode = None
+    HAS_QR = False
 
 WEB_DIR = Path(__file__).with_name("static")
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
@@ -55,13 +65,18 @@ class Dashboard:
         self.discovery = DiscoveryService(self.config.device_name, self.receiver.port)
         self.discovery.start()
         self.outgoing: list[dict] = []
+        self.cancel_events: Dict[str, threading.Event] = {}
         self.lock = threading.Lock()
 
     def state(self) -> dict:
         diagnostics = self.discovery.diagnostics()
         incoming = [_transfer_data(t) for t in self.receiver.history()]
         with self.lock:
-            outgoing = [dict(item) for item in self.outgoing]
+            outgoing = []
+            for item in self.outgoing:
+                public = {key: value for key, value in item.items() if not key.startswith("_")}
+                public["can_cancel"] = item.get("status") == "sending"
+                outgoing.append(public)
         return {
             "app": "xdrop",
             "version": __version__,
@@ -69,6 +84,7 @@ class Dashboard:
             "download_dir": str(self.config.download_dir),
             "local_ip": diagnostics.get("local_ip") or _primary_ipv4(),
             "port": self.receiver.port,
+            "qr_available": HAS_QR,
             "discovery": diagnostics,
             "peers": [
                 {"name": peer.name, "address": peer.address, "port": peer.port}
@@ -81,6 +97,35 @@ class Dashboard:
     def stop(self) -> None:
         self.discovery.stop()
         self.receiver.stop()
+
+    def cancel_outgoing(self, transfer_id: str) -> bool:
+        with self.lock:
+            item = next((entry for entry in self.outgoing if entry["id"] == transfer_id), None)
+            cancel_event = self.cancel_events.get(transfer_id)
+            if not item or item.get("status") != "sending" or cancel_event is None:
+                return False
+            cancel_event.set()
+            return True
+
+    def clear_finished_history(self) -> int:
+        incoming_count = self.receiver.clear_finished_history()
+        terminal = {"done", "failed", "cancelled", "rejected"}
+        with self.lock:
+            before = len(self.outgoing)
+            self.outgoing = [item for item in self.outgoing if item.get("status") not in terminal]
+            for transfer_id in list(self.cancel_events):
+                if not any(item["id"] == transfer_id for item in self.outgoing):
+                    self.cancel_events.pop(transfer_id, None)
+            return incoming_count + before - len(self.outgoing)
+
+    @staticmethod
+    def open_download_folder(folder: Path) -> None:
+        if os.name == "nt":
+            os.startfile(str(folder))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(folder)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen(["xdg-open", str(folder)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -134,6 +179,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(403, {"error": "Local dashboard requests only"})
             return
         path = urlsplit(self.path).path
+        if path == "/api/pairing.svg":
+            dashboard = self.server.dashboard
+            if not HAS_QR:
+                self._json(503, {"error": "QR support is missing. Install the project dependencies with pip install -e ."})
+                return
+            address = dashboard.discovery.local_ip or _primary_ipv4()
+            if not address:
+                self._json(503, {"error": "No local network address was detected"})
+                return
+            qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, border=0)
+            qr.add_data(f"{address}:{dashboard.receiver.port}")
+            qr.make(fit=True)
+            matrix = qr.get_matrix()
+            quiet_zone = 4
+            side = len(matrix) + quiet_zone * 2
+            path = "".join(
+                f"M{x + quiet_zone},{y + quiet_zone}h1v1h-1z"
+                for y, row in enumerate(matrix)
+                for x, dark in enumerate(row)
+                if dark
+            )
+            svg = (
+                f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {side} {side}" '
+                f'shape-rendering="crispEdges"><rect width="100%" height="100%" fill="#fff"/>'
+                f'<path fill="#20271e" d="{path}"/></svg>'
+            ).encode("utf-8")
+            self._send(200, svg, "image/svg+xml; charset=utf-8")
+            return
         if path == "/api/state":
             self._json(200, self.server.dashboard.state())
             return
@@ -178,12 +251,41 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True})
                 return
 
+            if parsed.path == "/api/validate-peer":
+                endpoint = str(self._read_json().get("endpoint", "")).strip()
+                if not re.fullmatch(r"[^:]+:\d+", endpoint):
+                    raise ValueError("Enter an IP address or hostname followed by a port, such as 192.168.1.24:50000")
+                peer = parse_peer_endpoint(endpoint, 0)
+                if not peer:
+                    raise ValueError("That address or port is not valid. Check both and try again.")
+                self._json(200, {"ok": True, "address": peer.address, "port": peer.port, "label": f"{peer.address}:{peer.port}"})
+                return
+
+            if parsed.path == "/api/history/clear":
+                removed = dashboard.clear_finished_history()
+                self._json(200, {"ok": True, "removed": removed})
+                return
+
             if parsed.path.startswith("/api/incoming/"):
                 transfer_id = parsed.path.rsplit("/", 1)[-1]
                 accept = bool(self._read_json().get("accept"))
                 if not dashboard.receiver.decide(transfer_id, accept):
                     self._json(404, {"error": "Incoming offer is no longer pending"})
                     return
+                self._json(200, {"ok": True})
+                return
+
+            if parsed.path.startswith("/api/outgoing/") and parsed.path.endswith("/cancel"):
+                transfer_id = parsed.path.split("/")[-2]
+                if not dashboard.cancel_outgoing(transfer_id):
+                    self._json(409, {"error": "This transfer can no longer be cancelled"})
+                    return
+                self._json(200, {"ok": True})
+                return
+
+            if parsed.path == "/api/open-download-folder":
+                dashboard.config.ensure_download_dir()
+                dashboard.open_download_folder(dashboard.config.download_dir)
                 self._json(200, {"ok": True})
                 return
 
@@ -196,6 +298,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise ValueError("Choose a valid peer")
                 if not address or not 1 <= port <= 65535:
                     raise ValueError("Choose a valid peer")
+                peer = parse_peer_endpoint(f"{address}:{port}", port)
+                if not peer:
+                    raise ValueError("Enter a valid IP address or hostname and port")
+                address = peer.address
                 length = int(self.headers.get("Content-Length", "-1"))
                 if length < 0 or length > MAX_UPLOAD_BYTES:
                     raise ValueError("File is too large (maximum 2 GB)")
@@ -217,33 +323,45 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     item: Dict[str, Any] = {
                         "id": str(time.time_ns()), "filename": filename, "size": length,
                         "sent": 0, "status": "connecting", "peer": address,
-                        "error": None, "started_at": time.time(),
+                        "error": None, "started_at": time.time(), "speed_bps": 0,
                     }
+                    cancel_event = threading.Event()
                     with dashboard.lock:
                         dashboard.outgoing.append(item)
                         dashboard.outgoing = dashboard.outgoing[-100:]
+                        dashboard.cancel_events[item["id"]] = cancel_event
 
                     def worker() -> None:
-                        with dashboard.lock:
-                            item["status"] = "sending"
-
+                        progress_started = None
                         def progress(sent: int, total: int) -> None:
+                            nonlocal progress_started
+                            now = time.time()
+                            if progress_started is None:
+                                progress_started = now
                             with dashboard.lock:
                                 item["sent"] = sent
                                 item["size"] = total
+                                item["status"] = "sending"
+                                item["speed_bps"] = sent / max(now - progress_started, 0.001)
 
                         try:
                             result = send_file(
-                                address, port, renamed_path, dashboard.config.device_name, progress=progress
+                                address, port, renamed_path, dashboard.config.device_name,
+                                progress=progress, cancel_event=cancel_event,
                             )
                             with dashboard.lock:
-                                item["status"] = "done" if result.get("ok") else "failed"
+                                if result.get("reason") == "transfer cancelled by user":
+                                    item["status"] = "cancelled"
+                                else:
+                                    item["status"] = "done" if result.get("ok") else "failed"
                                 item["error"] = result.get("reason") or None
                         except Exception as exc:
                             with dashboard.lock:
                                 item["status"] = "failed"
                                 item["error"] = str(exc)
                         finally:
+                            with dashboard.lock:
+                                dashboard.cancel_events.pop(item["id"], None)
                             try:
                                 renamed_path.unlink()
                             except OSError:

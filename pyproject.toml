@@ -42,6 +42,7 @@ dependencies = [
   "cryptography>=41",
   "rich>=13",
   "tqdm>=4.65",
+  "qrcode>=7.4",
 ]
 
 [project.urls]

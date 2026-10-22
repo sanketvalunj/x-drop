@@ -420,6 +420,16 @@ class ReceiverServer:
         with self._lock:
             return list(self.transfers)
 
+    def clear_finished_history(self) -> int:
+        """Remove completed incoming transfers while keeping active and pending ones."""
+        with self._lock:
+            before = len(self.transfers)
+            self.transfers = [
+                transfer for transfer in self.transfers
+                if transfer.status in (STATUS_PENDING, STATUS_ACTIVE)
+            ]
+            return before - len(self.transfers)
+
     def download_dir(self) -> Path:
         """Public accessor for the configured download directory."""
         return self._get_dir()
