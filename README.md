@@ -45,8 +45,8 @@ xdrop-web
 It opens at `http://127.0.0.1:8765` and is only available on the computer
 running xdrop. The dashboard can discover devices, send files, manage incoming
 requests, show live outgoing transfer progress with cancellation, accept drag-and-drop
-file selection, send multiple files one by one, show a QR code for this device's
-address, connect by IP, search and filter transfer history, clear completed history,
+file selection, send multiple files one by one, show and scan connection QR codes,
+resume interrupted outgoing transfers, connect by IP, search and filter transfer history, clear completed history,
 copy this device's address and port, open the download folder, and change the device
 name and download location.
 
@@ -73,10 +73,11 @@ Received files land in `~/xdrop_files/` by default.
 - **Transport**: a fresh TCP socket per session with bounded concurrency (up to 4 concurrent transfers).
 - **Handshake**: X25519 ECDH → HKDF-SHA256 → 32-byte AES key.
 - **Stream**: each frame is `[12-byte nonce][4-byte length][AES-256-GCM ciphertext]`.
-- **Atomic staging & Integrity**: incoming files are streamed into a temporary `.part` file.
-  Receiver pre-checks available disk storage before accepting. Sender streams a SHA-256
-  of the file; receiver verifies the hash upon completion. Only verified files are atomically
-  promoted to the destination folder; aborted or mismatched files are wiped immediately.
+- **Resumable staging & Integrity**: incoming files are streamed into a temporary `.part` file.
+  The offer includes the file size and SHA-256 identity; a retry of the same file resumes from
+  the stored byte offset. The receiver verifies the complete hash before atomically promoting
+  the file. Interrupted partials remain in the download folder as hidden `.xdrop_*.part` files;
+  mismatched partials are removed.
 
 ## Windows firewall
 

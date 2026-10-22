@@ -56,7 +56,7 @@ function transferCard(item, direction) {
   const eta = speed > 0 ? ` · ${Math.ceil(Math.max(0,total-sent)/speed)}s left` : '';
   const status = item.status === 'done' ? 'Complete' : item.status === 'cancelled' ? 'Cancelled' : item.status === 'failed' ? (item.error || 'Failed') : item.status === 'connecting' ? 'Waiting for receiver' : `${percent}% · ${size(speed)}/s${eta}`;
   const mark = item.status === 'done' ? '✓' : item.status === 'failed' ? '!' : item.status === 'cancelled' ? '×' : '⇅';
-  return `<div class="file-card"><div class="file-icon">${mark}</div><div class="file-meta"><strong>${escapeHTML(item.filename)}</strong><span>${direction === 'out' ? `To ${escapeHTML(item.peer)}` : `From ${escapeHTML(item.sender)}`} · ${size(total)}</span>${!done ? `<div class="progress-wrap"><i style="width:${percent}%"></i></div>` : ''}</div><div class="transfer-status">${escapeHTML(status)}</div>${item.can_cancel ? `<button class="button button-danger button-small" data-cancel-transfer="${escapeHTML(item.id)}">Cancel</button>` : ''}</div>`;
+  return `<div class="file-card"><div class="file-icon">${mark}</div><div class="file-meta"><strong>${escapeHTML(item.filename)}</strong><span>${direction === 'out' ? `To ${escapeHTML(item.peer)}` : `From ${escapeHTML(item.sender)}`} · ${size(total)}${item.error ? ` · ${escapeHTML(item.error)}` : ''}</span>${!done ? `<div class="progress-wrap"><i style="width:${percent}%"></i></div>` : ''}</div><div class="transfer-status">${escapeHTML(status)}</div>${item.can_cancel ? `<button class="button button-danger button-small" data-cancel-transfer="${escapeHTML(item.id)}">Cancel</button>` : ''}${direction === 'out' && item.can_resume ? `<button class="button button-secondary button-small" data-resume-transfer="${escapeHTML(item.id)}">Resume</button>` : ''}</div>`;
 }
 function heading(kicker, title, subtitle, action = '') {
   return `<div class="page-heading"><div><div class="eyebrow">${kicker}</div><h1>${title}</h1><p>${subtitle}</p></div>${action}</div>`;
@@ -117,7 +117,7 @@ function settingsView() {
   return `${heading('PREFERENCES','Settings','Personalize this device and choose where files are saved.')}
     <div class="settings-grid"><section class="setting-card"><h3>This device</h3><p>Your device name is shown to nearby xdrop users.</p><form id="name-form"><div class="field"><label for="device-name">DEVICE NAME</label><input id="device-name" maxlength="48" required value="${escapeHTML(state.device_name)}"></div><button class="button button-primary" type="submit">Save name</button></form></section>
     <section class="setting-card"><h3>Download location</h3><p>Received files are saved to this folder.</p><form id="folder-form"><div class="field"><label for="download-dir">FOLDER PATH</label><input id="download-dir" required value="${escapeHTML(state.download_dir)}"></div><div class="form-actions"><button class="button button-primary" type="submit">Save location</button><button class="button button-quiet" type="button" data-action="open-folder">Open folder ↗</button></div></form></section>
-    <section class="setting-card"><h3>Pair another device</h3><p>Scan this code to read this device’s connection address and port.</p>${state.qr_available && state.local_ip ? `<div class="pairing-qr"><img src="/api/pairing.svg" alt="QR code for ${escapeHTML(state.local_ip)}:${state.port}"><div><strong>${escapeHTML(state.device_name)}</strong><span>Scan, then enter this address in Connect by IP.</span></div></div>` : `<div class="qr-unavailable">${!state.qr_available ? 'Install xdrop dependencies to enable QR pairing.' : 'No local network address was detected.'}</div>`}<div class="copy-address-row"><div><span>Address and port</span><strong>${escapeHTML(state.local_ip ? `${state.local_ip}:${state.port}` : 'Address not detected')}</strong></div><button class="button button-quiet button-small" data-copy-address="${escapeHTML(state.local_ip ? `${state.local_ip}:${state.port}` : '')}" ${state.local_ip ? '' : 'disabled'}>Copy</button></div><div class="network-info"><span>Discovery</span><strong>${state.discovery.registered ? 'Available' : 'Limited'}</strong></div></section>
+    <section class="setting-card"><h3>Pair another device</h3><p>Share your code, or scan a nearby xdrop code with this device’s camera.</p>${state.qr_available && state.local_ip ? `<div class="pairing-qr"><img src="/api/pairing.svg" alt="QR code for ${escapeHTML(state.local_ip)}:${state.port}"><div><strong>${escapeHTML(state.device_name)}</strong><span>Another device can scan this code and connect.</span><button class="button button-secondary button-small" type="button" data-action="scan-qr">▦ Scan a code</button></div></div>` : `<div class="qr-unavailable">${!state.qr_available ? 'Install xdrop dependencies to enable QR pairing.' : 'No local network address was detected.'}<button class="button button-secondary button-small" type="button" data-action="scan-qr">▦ Scan a code</button></div>`}<div class="copy-address-row"><div><span>Address and port</span><strong>${escapeHTML(state.local_ip ? `${state.local_ip}:${state.port}` : 'Address not detected')}</strong></div><button class="button button-quiet button-small" data-copy-address="${escapeHTML(state.local_ip ? `${state.local_ip}:${state.port}` : '')}" ${state.local_ip ? '' : 'disabled'}>Copy</button></div><div class="network-info"><span>Discovery</span><strong>${state.discovery.registered ? 'Available' : 'Limited'}</strong></div></section>
     <section class="setting-card"><h3>Privacy & security</h3><p>Each transfer uses a fresh encrypted connection and verifies file integrity before saving.</p><div class="security-line"><span class="security-check">✓</span><span><strong>End-to-end encrypted</strong><small>X25519 · AES-256-GCM · SHA-256</small></span></div></section></div>`;
 }
 function render() {
@@ -152,6 +152,8 @@ document.addEventListener('click', async event => {
   if (nav) { switchView(nav.dataset.view); return; }
   const action = event.target.closest('[data-action]');
   if (action?.dataset.action === 'send') { switchView('send'); return; }
+  if (action?.dataset.action === 'scan-qr') { await startQrScanner(); return; }
+  if (action?.dataset.action === 'close-scanner') { closeQrScanner(); return; }
   if (action?.dataset.action === 'refresh' || event.target.closest('#refresh')) { await refresh(); notify('Updated'); return; }
   if (action?.dataset.action === 'open-folder') {
     try { await request('/api/open-download-folder',{method:'POST'}); notify('Opened download folder'); }
@@ -190,6 +192,15 @@ document.addEventListener('click', async event => {
       if (currentView !== 'send') await refresh();
     }
     catch (error) { notify(error.message, true); }
+    return;
+  }
+  const resume = event.target.closest('[data-resume-transfer]');
+  if (resume) {
+    try {
+      await request(`/api/outgoing/${encodeURIComponent(resume.dataset.resumeTransfer)}/resume`,{method:'POST'});
+      await refresh();
+      notify('Resuming transfer…');
+    } catch (error) { notify(error.message, true); }
     return;
   }
 });
@@ -299,6 +310,54 @@ async function waitForOutgoing(id, filename, index, total) {
   }
 }
 document.querySelector('#refresh').addEventListener('click', refresh);
+let scannerStream = null;
+let scannerTimer = null;
+async function startQrScanner() {
+  const video = document.querySelector('#scanner-video');
+  const modal = document.querySelector('#scanner-modal');
+  if (!('BarcodeDetector' in window) || !navigator.mediaDevices?.getUserMedia) {
+    notify('QR scanning is not supported in this browser. Enter the address manually.', true);
+    switchView('send');
+    return;
+  }
+  try {
+    scannerStream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false});
+    video.srcObject = scannerStream;
+    modal.hidden = false;
+    await video.play();
+    const detector = new BarcodeDetector({formats:['qr_code']});
+    const scan = async () => {
+      if (!scannerStream || modal.hidden) return;
+      try {
+        const codes = await detector.detect(video);
+        if (codes.length) {
+          const endpoint = String(codes[0].rawValue || '').trim();
+          closeQrScanner();
+          const peer = await request('/api/validate-peer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({endpoint})});
+          switchView('send', peer.label);
+          notify(`Address checked: ${peer.label}`);
+          return;
+        }
+      } catch (error) { closeQrScanner(); notify(error.message || 'Could not read that QR code', true); return; }
+      scannerTimer = setTimeout(scan, 250);
+    };
+    scannerTimer = setTimeout(scan, 250);
+  } catch (error) {
+    closeQrScanner();
+    notify(error.name === 'NotAllowedError' ? 'Allow camera access to scan a QR code' : (error.message || 'Could not start the camera'), true);
+  }
+}
+function closeQrScanner() {
+  clearTimeout(scannerTimer);
+  scannerTimer = null;
+  if (scannerStream) scannerStream.getTracks().forEach(track => track.stop());
+  scannerStream = null;
+  const modal = document.querySelector('#scanner-modal');
+  const video = document.querySelector('#scanner-video');
+  if (modal) modal.hidden = true;
+  if (video) video.srcObject = null;
+}
+document.addEventListener('keydown', event => { if (event.key === 'Escape') closeQrScanner(); });
 refresh();
 setInterval(() => {
   const focusedControl = root.contains(document.activeElement) && document.activeElement.matches('input,select,textarea');

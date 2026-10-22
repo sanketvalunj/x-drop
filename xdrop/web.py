@@ -76,6 +76,7 @@ class Dashboard:
             for item in self.outgoing:
                 public = {key: value for key, value in item.items() if not key.startswith("_")}
                 public["can_cancel"] = item.get("status") == "sending"
+                public["can_resume"] = item.get("status") in {"failed", "cancelled"} and Path(item.get("_source_path", "")).is_file()
                 outgoing.append(public)
         return {
             "app": "xdrop",
@@ -107,11 +108,73 @@ class Dashboard:
             cancel_event.set()
             return True
 
+    def resume_outgoing(self, transfer_id: str) -> bool:
+        with self.lock:
+            item = next((entry for entry in self.outgoing if entry["id"] == transfer_id), None)
+            if not item or item.get("status") not in {"failed", "cancelled"}:
+                return False
+            source = Path(item.get("_source_path", ""))
+            if not source.is_file():
+                return False
+            item["sent"] = 0
+            item["status"] = "connecting"
+            item["error"] = None
+            item["started_at"] = time.time()
+        self._start_outgoing(item)
+        return True
+
+    def _start_outgoing(self, item: dict) -> None:
+        cancel_event = threading.Event()
+        with self.lock:
+            self.cancel_events[item["id"]] = cancel_event
+        def worker() -> None:
+            progress_started = None
+            def progress(sent: int, total: int) -> None:
+                nonlocal progress_started
+                now = time.time()
+                if progress_started is None:
+                    progress_started = now
+                with self.lock:
+                    item["sent"] = sent
+                    item["size"] = total
+                    item["status"] = "sending"
+                    item["speed_bps"] = sent / max(now - progress_started, 0.001)
+            try:
+                result = send_file(
+                    item["peer"], item["port"], Path(item["_source_path"]),
+                    self.config.device_name, progress=progress,
+                    cancel_event=cancel_event, display_filename=item["filename"],
+                )
+                with self.lock:
+                    item["status"] = "done" if result.get("ok") else (
+                        "cancelled" if result.get("reason") == "transfer cancelled by user" else "failed"
+                    )
+                    item["error"] = result.get("reason") or None
+                    if result.get("ok"):
+                        try:
+                            Path(item["_source_path"]).unlink(missing_ok=True)
+                        except OSError:
+                            pass
+            except Exception as exc:
+                with self.lock:
+                    item["status"] = "failed"
+                    item["error"] = str(exc)
+            finally:
+                with self.lock:
+                    self.cancel_events.pop(item["id"], None)
+        threading.Thread(target=worker, name="xdrop-web-send", daemon=True).start()
+
     def clear_finished_history(self) -> int:
         incoming_count = self.receiver.clear_finished_history()
         terminal = {"done", "failed", "cancelled", "rejected"}
         with self.lock:
             before = len(self.outgoing)
+            for item in self.outgoing:
+                if item.get("status") in terminal:
+                    try:
+                        Path(item.get("_source_path", "")).unlink(missing_ok=True)
+                    except OSError:
+                        pass
             self.outgoing = [item for item in self.outgoing if item.get("status") not in terminal]
             for transfer_id in list(self.cancel_events):
                 if not any(item["id"] == transfer_id for item in self.outgoing):
@@ -283,6 +346,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True})
                 return
 
+            if parsed.path.startswith("/api/outgoing/") and parsed.path.endswith("/resume"):
+                transfer_id = parsed.path.split("/")[-2]
+                if not dashboard.resume_outgoing(transfer_id):
+                    self._json(409, {"error": "This transfer cannot be resumed because its source file is unavailable"})
+                    return
+                self._json(200, {"ok": True})
+                return
+
             if parsed.path == "/api/open-download-folder":
                 dashboard.config.ensure_download_dir()
                 dashboard.open_download_folder(dashboard.config.download_dir)
@@ -323,51 +394,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     item: Dict[str, Any] = {
                         "id": str(time.time_ns()), "filename": filename, "size": length,
                         "sent": 0, "status": "connecting", "peer": address,
+                        "port": port, "_source_path": str(renamed_path),
                         "error": None, "started_at": time.time(), "speed_bps": 0,
                     }
-                    cancel_event = threading.Event()
                     with dashboard.lock:
                         dashboard.outgoing.append(item)
                         dashboard.outgoing = dashboard.outgoing[-100:]
-                        dashboard.cancel_events[item["id"]] = cancel_event
-
-                    def worker() -> None:
-                        progress_started = None
-                        def progress(sent: int, total: int) -> None:
-                            nonlocal progress_started
-                            now = time.time()
-                            if progress_started is None:
-                                progress_started = now
-                            with dashboard.lock:
-                                item["sent"] = sent
-                                item["size"] = total
-                                item["status"] = "sending"
-                                item["speed_bps"] = sent / max(now - progress_started, 0.001)
-
-                        try:
-                            result = send_file(
-                                address, port, renamed_path, dashboard.config.device_name,
-                                progress=progress, cancel_event=cancel_event,
-                            )
-                            with dashboard.lock:
-                                if result.get("reason") == "transfer cancelled by user":
-                                    item["status"] = "cancelled"
-                                else:
-                                    item["status"] = "done" if result.get("ok") else "failed"
-                                item["error"] = result.get("reason") or None
-                        except Exception as exc:
-                            with dashboard.lock:
-                                item["status"] = "failed"
-                                item["error"] = str(exc)
-                        finally:
-                            with dashboard.lock:
-                                dashboard.cancel_events.pop(item["id"], None)
-                            try:
-                                renamed_path.unlink()
-                            except OSError:
-                                pass
-
-                    threading.Thread(target=worker, name="xdrop-web-send", daemon=True).start()
+                    dashboard._start_outgoing(item)
                 except Exception:
                     try:
                         os.unlink(temp_name)

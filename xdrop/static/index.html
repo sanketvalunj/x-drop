@@ -37,6 +37,9 @@
       <footer class="footer"><span>Encrypted peer-to-peer sharing</span><span>xdrop <b id="version">1.0.5</b></span></footer>
     </main>
   </div>
+  <div class="scanner-modal" id="scanner-modal" hidden role="dialog" aria-modal="true" aria-labelledby="scanner-title">
+    <div class="scanner-panel"><button class="icon-button scanner-close" type="button" data-action="close-scanner" aria-label="Close scanner">×</button><h2 id="scanner-title">Scan a connection code</h2><p>Point your camera at the other device’s xdrop QR code.</p><video id="scanner-video" playsinline muted></video><div class="scanner-frame" aria-hidden="true"></div></div>
+  </div>
   <div class="toast" id="toast" role="status"></div>
 </body>
 </html>

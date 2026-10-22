@@ -12,7 +12,7 @@ Session lifecycle (after `crypto.handshake` completes):
       receiver → sender : JSON {"type":"ack","ok":bool,"reason":"..."}
 
 Features & Robustness:
-  - Atomic writing via temporary `.part` file (promoted on SHA-256 success, deleted on any error).
+  - Atomic writing via temporary `.part` file, with interrupted resumable transfers retained.
   - Pre-flight storage validation before accepting transfers.
   - Graceful cancellation signaling between peers.
   - Bounded concurrency with Semaphore to prevent resource exhaustion / DoS.
@@ -100,6 +100,12 @@ def sanitize_filename(name: str) -> str:
     return name[:200]
 
 
+def _resume_id(filename: str, size: int, sha256_hex: str) -> str:
+    """Create a stable resume key from the transmitted filename and file digest."""
+    identity = f"{filename}\0{size}\0{sha256_hex}".encode("utf-8")
+    return hashlib.sha256(identity).hexdigest()
+
+
 def human_size(n: int) -> str:
     f = float(n)
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -150,6 +156,7 @@ class IncomingTransfer:
         filename: str,
         size: int,
         started_at: float,
+        resume_offset: int = 0,
     ):
         self.id = id
         self.sender_name = sender_name
@@ -157,6 +164,7 @@ class IncomingTransfer:
         self.filename = filename
         self.size = size
         self.started_at = started_at
+        self.resume_offset = resume_offset
         self._status = STATUS_PENDING
         self._received = 0
         self._save_path: Optional[Path] = None
@@ -260,6 +268,7 @@ def send_file(
     sender_name: str,
     progress: Optional[Callable[[int, int], None]] = None,
     cancel_event: Optional[threading.Event] = None,
+    display_filename: Optional[str] = None,
 ) -> dict:
     """Send `filepath` to peer. Blocking. Returns a result dict.
 
@@ -270,6 +279,23 @@ def send_file(
         log.error(f"Send failed: {filepath} is not a valid file")
         return {"ok": False, "reason": f"not a file: {filepath}", "bytes_sent": 0}
     size = filepath.stat().st_size
+    filename = sanitize_filename(display_filename or filepath.name)
+    # The stable digest-derived key lets a retry identify the receiver's partial file.
+    source_hasher = hashlib.sha256()
+    try:
+        with filepath.open("rb") as source:
+            while True:
+                chunk = source.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                source_hasher.update(chunk)
+        file_digest = source_hasher.hexdigest()
+        if filepath.stat().st_size != size:
+            return {"ok": False, "reason": "file changed while preparing transfer", "bytes_sent": 0}
+    except Exception as e:
+        return {"ok": False, "reason": f"could not read file: {e}", "bytes_sent": 0}
+    transfer_id = _resume_id(filename, size, file_digest)
+    sent = 0
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(10.0)
@@ -287,17 +313,19 @@ def send_file(
         _send_json(ch, {
             "type": "offer",
             "sender": sender_name[:SENDER_NAME_MAX],
-            "filename": filepath.name,
+            "filename": filename,
             "size": size,
+            "sha256": file_digest,
+            "transfer_id": transfer_id,
         })
-        log.info(f"Offered {filepath.name} ({size} bytes) to {peer_addr}:{peer_port}")
+        log.info(f"Offered {filename} ({size} bytes) to {peer_addr}:{peer_port}")
 
         # Wait for receiver decision
         sock.settimeout(OFFER_TIMEOUT)
         resp = _recv_json(ch)
         if resp.get("type") != "response" or not resp.get("accept"):
             reason = resp.get("reason") or "rejected by peer"
-            log.info(f"Offer for {filepath.name} rejected by peer: {reason}")
+            log.info(f"Offer for {filename} rejected by peer: {reason}")
             return {
                 "ok": False,
                 "reason": reason,
@@ -306,16 +334,31 @@ def send_file(
 
         # Data transfer phase
         sock.settimeout(DATA_TIMEOUT)
-        sent = 0
         hasher = hashlib.sha256()
         with filepath.open("rb") as f:
+            try:
+                offset = int(resp.get("offset", 0))
+            except (TypeError, ValueError):
+                raise ValueError("receiver returned an invalid resume offset")
+            if offset < 0 or offset > size:
+                raise ValueError("receiver returned an out-of-range resume offset")
+            # Rehash the prefix to keep end-to-end verification correct on resume.
+            remaining_prefix = offset
+            while remaining_prefix:
+                prefix = f.read(min(CHUNK_SIZE, remaining_prefix))
+                if not prefix:
+                    raise ValueError("file ended while preparing resumed transfer")
+                hasher.update(prefix)
+                remaining_prefix -= len(prefix)
+            sent = offset
+            if progress:
+                try:
+                    progress(sent, size)
+                except Exception:
+                    pass
             while sent < size:
                 if cancel_event and cancel_event.is_set():
                     log.info(f"Send of {filepath.name} cancelled by user")
-                    try:
-                        _send_json(ch, {"type": "cancel", "reason": "cancelled by sender"})
-                    except Exception:
-                        pass
                     return {
                         "ok": False,
                         "reason": "transfer cancelled by user",
@@ -334,8 +377,12 @@ def send_file(
                     except Exception:
                         pass
 
+        if hasher.hexdigest() != file_digest:
+            _send_json(ch, {"type": "done", "sha256": hasher.hexdigest()})
+            return {"ok": False, "reason": "file changed during transfer", "bytes_sent": sent}
+
         _send_json(ch, {"type": "done", "sha256": hasher.hexdigest()})
-        log.info(f"Sent all {sent} bytes of {filepath.name}, awaiting acknowledgement")
+        log.info(f"Sent all {sent} bytes of {filename}, awaiting acknowledgement")
 
         # Best-effort wait for receiver's ack
         try:
@@ -343,7 +390,7 @@ def send_file(
             ack = _recv_json(ch)
             if ack.get("type") == "ack" and ack.get("ok") is False:
                 reason = ack.get("reason") or "receiver verification failed"
-                log.warning(f"Receiver failed verification for {filepath.name}: {reason}")
+                log.warning(f"Receiver failed verification for {filename}: {reason}")
                 return {
                     "ok": False,
                     "reason": reason,
@@ -352,11 +399,11 @@ def send_file(
         except Exception as e:
             log.warning(f"Timed out or failed awaiting ack: {e}")
 
-        log.info(f"Successfully transferred {filepath.name} ({sent} bytes)")
-        return {"ok": True, "reason": "", "bytes_sent": sent, "sha256": hasher.hexdigest()}
+        log.info(f"Successfully transferred {filename} ({sent} bytes)")
+        return {"ok": True, "reason": "", "bytes_sent": sent, "sha256": hasher.hexdigest(), "transfer_id": transfer_id}
     except Exception as e:
-        log.error(f"Transfer error for {filepath.name}: {e}")
-        return {"ok": False, "reason": f"transfer error: {e}", "bytes_sent": 0}
+        log.error(f"Transfer error for {filename}: {e}")
+        return {"ok": False, "reason": f"transfer error: {e}", "bytes_sent": sent}
     finally:
         try:
             sock.close()
@@ -501,6 +548,8 @@ class ReceiverServer:
         sender_addr = f"{addr[0]}:{addr[1]}"
         t: Optional[IncomingTransfer] = None
         temp_path: Optional[Path] = None
+        resumable = False
+        meta_path: Optional[Path] = None
         try:
             conn.settimeout(30.0)
             ch = handshake(conn)
@@ -523,8 +572,31 @@ class ReceiverServer:
                 return
 
             sender_name = str(offer.get("sender") or "unknown")[:SENDER_NAME_MAX]
+            offered_digest = str(offer.get("sha256") or "")
+            offered_id = str(offer.get("transfer_id") or "")
+            resumable = bool(
+                re.fullmatch(r"[0-9a-f]{64}", offered_digest)
+                and re.fullmatch(r"[0-9a-f]{64}", offered_id)
+                and _resume_id(filename, size, offered_digest) == offered_id
+            )
             dest_dir = self._get_dir()
             dest_dir.mkdir(parents=True, exist_ok=True)
+
+            part_path = dest_dir / f".xdrop_{offered_id}.part" if resumable else None
+            meta_path = dest_dir / f".xdrop_{offered_id}.json" if resumable else None
+            resume_offset = 0
+            if resumable and part_path and meta_path:
+                try:
+                    metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+                    if (metadata == {"filename": filename, "size": size, "sha256": offered_digest}
+                            and part_path.is_file() and part_path.stat().st_size <= size):
+                        resume_offset = part_path.stat().st_size
+                    else:
+                        part_path.unlink(missing_ok=True)
+                        meta_path.unlink(missing_ok=True)
+                except (OSError, ValueError, TypeError):
+                    part_path.unlink(missing_ok=True)
+                    meta_path.unlink(missing_ok=True)
 
             t = IncomingTransfer(
                 id=uuid.uuid4().hex[:8],
@@ -533,12 +605,14 @@ class ReceiverServer:
                 filename=filename,
                 size=size,
                 started_at=time.time(),
+                resume_offset=resume_offset,
             )
+            t.received = resume_offset
 
             # Pre-flight storage check
-            if not check_disk_space(dest_dir, size):
+            if not check_disk_space(dest_dir, size - resume_offset):
                 free_bytes = get_free_disk_space(dest_dir)
-                reason = f"insufficient storage (needs {human_size(size)}, available {human_size(free_bytes)})"
+                reason = f"insufficient storage (needs {human_size(size - resume_offset)}, available {human_size(free_bytes)})"
                 log.warning(f"Rejecting {filename} from {sender_name}: {reason}")
                 t.status = STATUS_FAILED
                 t.error = reason
@@ -588,20 +662,29 @@ class ReceiverServer:
                     self.on_update(t)
                 return
 
-            # Accepted: stage to atomic temporary file (.xdrop_tmp_<id>.part)
-            temp_path = dest_dir / f".xdrop_tmp_{t.id}.part"
+            # Accepted transfers keep a stable partial file so the same sender can resume.
+            temp_path = part_path if resumable and part_path else dest_dir / f".xdrop_tmp_{t.id}.part"
             t.temp_path = temp_path
             t.status = STATUS_ACTIVE
             if self.on_update:
                 self.on_update(t)
-            _send_json(ch, {"type": "response", "accept": True})
+            if resumable and meta_path:
+                meta_tmp = meta_path.with_suffix(".json.tmp")
+                meta_tmp.write_text(json.dumps({"filename": filename, "size": size, "sha256": offered_digest}), encoding="utf-8")
+                os.replace(meta_tmp, meta_path)
+                temp_path.touch(exist_ok=True)
+            _send_json(ch, {"type": "response", "accept": True, "offset": resume_offset})
             log.info(f"Transfer {t.id} accepted. Staging to temporary file {temp_path.name}")
 
             # Data transfer phase
             conn.settimeout(DATA_TIMEOUT)
-            received = 0
+            received = resume_offset
             hasher = hashlib.sha256()
-            with temp_path.open("wb") as out:
+            if resume_offset:
+                with temp_path.open("rb") as prefix_file:
+                    for prefix in iter(lambda: prefix_file.read(CHUNK_SIZE), b""):
+                        hasher.update(prefix)
+            with temp_path.open("ab" if resume_offset else "wb") as out:
                 while received < size:
                     frame = ch.recv()
                     if not frame:
@@ -630,7 +713,8 @@ class ReceiverServer:
                 t.status = STATUS_FAILED
                 t.error = f"truncated: got {received}/{size} bytes"
                 log.error(f"Transfer {t.id} truncated: {received}/{size} bytes")
-            elif expected_sha and hasher.hexdigest() != expected_sha:
+            elif ((expected_sha and hasher.hexdigest() != expected_sha)
+                  or (resumable and hasher.hexdigest() != offered_digest)):
                 t.status = STATUS_FAILED
                 t.error = "integrity check failed (sha256 mismatch)"
                 log.error(f"Transfer {t.id} sha256 mismatch (expected {expected_sha}, computed {hasher.hexdigest()})")
@@ -643,9 +727,11 @@ class ReceiverServer:
                 final_path = _unique_path(dest_dir / filename)
                 os.replace(temp_path, final_path)
                 temp_path = None  # Successfully promoted
+                if meta_path:
+                    meta_path.unlink(missing_ok=True)
                 t.save_path = final_path
                 t.status = STATUS_DONE
-                t.verified = bool(expected_sha)
+                t.verified = bool(expected_sha and hasher.hexdigest() == expected_sha and (not resumable or hasher.hexdigest() == offered_digest))
                 log.info(f"Transfer {t.id} verified and saved to {final_path}")
                 try:
                     _send_json(ch, {"type": "ack", "ok": True})
@@ -665,12 +751,22 @@ class ReceiverServer:
                     self.on_update(t)
         finally:
             # Clean up partial temporary file if it wasn't promoted
-            if temp_path and temp_path.exists():
+            preserve_partial = bool(
+                resumable and temp_path and temp_path.exists()
+                and t is not None and t.status == STATUS_FAILED
+                and not (t.error or "").startswith("integrity check failed")
+            )
+            if temp_path and temp_path.exists() and not preserve_partial:
                 try:
                     temp_path.unlink()
                     log.info(f"Cleaned up partial file {temp_path.name}")
                 except Exception as err:
                     log.warning(f"Failed to clean up partial file {temp_path}: {err}")
+            if resumable and not preserve_partial and meta_path:
+                try:
+                    meta_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             try:
                 conn.close()
             except Exception:
