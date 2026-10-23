@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import webbrowser
+from collections import Counter, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict
@@ -17,6 +20,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
 from .config import Config
+from .crypto import GCM_TAG_LEN, HANDSHAKE_LEN, LEN_LEN, NONCE_LEN
 from .discovery import DiscoveryService, _primary_ipv4, parse_peer_endpoint
 from .logger import init_logging
 from .transfer import CHUNK_SIZE, IncomingTransfer, ReceiverServer, probe_peer, sanitize_filename, send_file
@@ -30,6 +34,138 @@ except ImportError:
 
 WEB_DIR = Path(__file__).with_name("static")
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+MAX_TRACE_HOPS = 8
+
+
+class ProtocolRecorder:
+    """Aggregate observed xdrop records without retaining file payloads."""
+
+    def __init__(self) -> None:
+        self.started_at = time.time()
+        self.lock = threading.Lock()
+        self.sequence = 0
+        self.total = Counter()
+        self.by_type: dict[tuple[str, str], Counter] = {}
+        self.chunk_sizes: Counter = Counter()
+        self.recent = deque(maxlen=120)
+
+    def record(self, event: dict) -> None:
+        direction = str(event.get("direction", "unknown"))
+        record_type = str(event.get("record_type", "record"))
+        plaintext = max(0, int(event.get("plaintext_bytes", 0)))
+        ciphertext = max(0, int(event.get("ciphertext_bytes", 0)))
+        frame_bytes = max(0, int(event.get("frame_bytes", 0)))
+        overhead = max(0, int(event.get("overhead_bytes", 0)))
+        with self.lock:
+            self.sequence += 1
+            item = {
+                "sequence": self.sequence,
+                "time_ms": round(max(0, float(event.get("timestamp", time.time())) - self.started_at) * 1000, 2),
+                "direction": direction,
+                "record_type": record_type,
+                "plaintext_bytes": plaintext,
+                "ciphertext_bytes": ciphertext,
+                "frame_bytes": frame_bytes,
+                "overhead_bytes": overhead,
+                "encrypted": bool(event.get("encrypted")),
+            }
+            self.recent.append(item)
+            self.total.update({
+                "records": 1,
+                "plaintext_bytes": plaintext,
+                "ciphertext_bytes": ciphertext,
+                "frame_bytes": frame_bytes,
+                "overhead_bytes": overhead,
+                "encrypted_records": int(item["encrypted"]),
+                "encrypted_frame_bytes": frame_bytes if item["encrypted"] else 0,
+            })
+            counter = self.by_type.setdefault((direction, record_type), Counter())
+            counter.update({
+                "records": 1,
+                "plaintext_bytes": plaintext,
+                "ciphertext_bytes": ciphertext,
+                "frame_bytes": frame_bytes,
+                "overhead_bytes": overhead,
+            })
+            if record_type == "file_chunk":
+                self.chunk_sizes[plaintext] += 1
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {
+                "totals": dict(self.total),
+                "by_type": [
+                    {"direction": direction, "record_type": record_type, **dict(values)}
+                    for (direction, record_type), values in sorted(self.by_type.items())
+                ],
+                "chunk_sizes": [
+                    {"plaintext_bytes": amount, "records": count}
+                    for amount, count in sorted(self.chunk_sizes.items())
+                ],
+                "recent_records": list(self.recent),
+                "sample_limit": self.recent.maxlen,
+            }
+
+
+def _trace_route(target: str) -> dict:
+    """Run a short system traceroute to a peer and return parsed hop metadata."""
+    if os.name == "nt":
+        executable = shutil.which("tracert")
+        if not executable:
+            return {"target": target, "error": "Windows tracert is not available on this device", "hops": []}
+        command = [executable, "-d", "-h", str(MAX_TRACE_HOPS), "-w", "500", target]
+    else:
+        executable = shutil.which("traceroute")
+        if executable:
+            command = [executable, "-n", "-m", str(MAX_TRACE_HOPS), "-q", "1", "-w", "0.7", target]
+        else:
+            executable = shutil.which("tracepath")
+        if not executable:
+            return {"target": target, "error": "The traceroute command is not installed on this device", "hops": []}
+        if Path(executable).name == "tracepath":
+            command = [executable, "-n", "-m", str(MAX_TRACE_HOPS), target]
+
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=15, check=False)
+        output = (result.stdout or "") + "\n" + (result.stderr or "")
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        output = stdout + "\n" + stderr
+    except OSError as exc:
+        return {"target": target, "error": f"Could not start traceroute: {exc}", "hops": []}
+
+    hops = []
+    for line in output.splitlines():
+        match = re.match(r"^\s*(\d+)(?:\?)?:?\s+(.*)$", line)
+        if not match:
+            continue
+        number = int(match.group(1))
+        if not 1 <= number <= MAX_TRACE_HOPS:
+            continue
+        detail = match.group(2)
+        addresses = re.findall(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])", detail)
+        hop_address = None
+        for candidate in addresses:
+            try:
+                hop_address = str(ipaddress.IPv4Address(candidate))
+                break
+            except ValueError:
+                continue
+        latency_match = re.search(r"<?\s*(\d+(?:\.\d+)?)\s*ms", detail, re.IGNORECASE)
+        hops.append({
+            "hop": number,
+            "address": hop_address,
+            "latency_ms": float(latency_match.group(1)) if latency_match else None,
+            "reached": hop_address == target,
+        })
+    reached = any(hop["reached"] for hop in hops)
+    error = None
+    if not hops:
+        error = next((line.strip() for line in output.splitlines() if re.search(
+            r"not found|permission|operation not permitted|failed|error|usage:", line, re.IGNORECASE
+        )), None)
+    return {"target": target, "hops": hops, "reached": reached, "error": error, "max_hops": MAX_TRACE_HOPS}
 
 
 def _transfer_data(transfer: IncomingTransfer) -> dict:
@@ -70,6 +206,7 @@ class Dashboard:
         self.outgoing: list[dict] = []
         self.cancel_events: Dict[str, threading.Event] = {}
         self.quality: Dict[str, dict] = {}
+        self.protocol_telemetry: Dict[str, ProtocolRecorder] = {}
         self.lock = threading.Lock()
 
     def state(self) -> dict:
@@ -162,6 +299,7 @@ class Dashboard:
         cancel_event = threading.Event()
         with self.lock:
             self.cancel_events[item["id"]] = cancel_event
+            telemetry = self.protocol_telemetry.setdefault(item["id"], ProtocolRecorder())
         def worker() -> None:
             progress_started = None
             progress_last_at = None
@@ -186,6 +324,7 @@ class Dashboard:
                     item["peer"], item["port"], Path(item["_source_path"]),
                     self.config.device_name, progress=progress,
                     cancel_event=cancel_event, display_filename=item["filename"],
+                    frame_observer=telemetry.record,
                 )
                 with self.lock:
                     item["status"] = "done" if result.get("ok") else (
@@ -201,7 +340,7 @@ class Dashboard:
                     )
                     if duration and item["throughput_bps"] is not None:
                         item["speed_bps"] = item["throughput_bps"]
-                    if result.get("ok"):
+                    if result.get("ok") and not item.get("_delivery_group"):
                         try:
                             Path(item["_source_path"]).unlink(missing_ok=True)
                         except OSError:
@@ -213,7 +352,21 @@ class Dashboard:
             finally:
                 with self.lock:
                     self.cancel_events.pop(item["id"], None)
+                if item.get("_delivery_group"):
+                    self._cleanup_delivery_source(item["_delivery_group"])
         threading.Thread(target=worker, name="xdrop-web-send", daemon=True).start()
+
+    def _cleanup_delivery_source(self, group_id: str) -> None:
+        """Remove one shared upload only after every recipient succeeded."""
+        with self.lock:
+            group = [item for item in self.outgoing if item.get("_delivery_group") == group_id]
+            if not group or not all(item.get("status") == "done" for item in group):
+                return
+            source = Path(group[0]["_source_path"])
+        try:
+            source.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def clear_finished_history(self) -> int:
         incoming_count = self.receiver.clear_finished_history()
@@ -226,6 +379,7 @@ class Dashboard:
                         Path(item.get("_source_path", "")).unlink(missing_ok=True)
                     except OSError:
                         pass
+                    self.protocol_telemetry.pop(item["id"], None)
             self.outgoing = [item for item in self.outgoing if item.get("status") not in terminal]
             for transfer_id in list(self.cancel_events):
                 if not any(item["id"] == transfer_id for item in self.outgoing):
@@ -385,6 +539,56 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._json(200, dashboard.check_peer_quality(peer.address, peer.port))
                 return
 
+            if parsed.path == "/api/route-trace":
+                body = self._read_json()
+                endpoint = str(body.get("endpoint", "")).strip()
+                transfer_id = str(body.get("transfer_id", "")).strip()
+                peer = parse_peer_endpoint(endpoint, 0)
+                if not peer:
+                    raise ValueError("Enter a valid peer address and port")
+                with dashboard.lock:
+                    transfer = next((item for item in dashboard.outgoing if item["id"] == transfer_id), None)
+                    if not transfer or transfer.get("status") != "done":
+                        raise ValueError("Protocol analysis is available after a successful outgoing transfer")
+                    if transfer.get("peer") != peer.address or int(transfer.get("port", 0)) != peer.port:
+                        raise ValueError("The route target does not match the selected transfer")
+                    recorder = dashboard.protocol_telemetry.get(transfer_id)
+                    transfer_summary = {
+                        "filename": transfer.get("filename"),
+                        "size_bytes": transfer.get("size", 0),
+                        "duration_s": transfer.get("duration_s"),
+                    }
+                telemetry = recorder.snapshot() if recorder else {
+                    "totals": {}, "by_type": [], "chunk_sizes": [], "recent_records": [], "sample_limit": 0,
+                }
+                trace = _trace_route(peer.address)
+                trace.update({
+                    "port": peer.port,
+                    "local_ip": dashboard.discovery.local_ip or _primary_ipv4(),
+                    "note": "These are separate system traceroute probes run now. They do not capture the file transfer; firewalls may hide some hops.",
+                    "transfer": transfer_summary,
+                    "protocol_analysis": {
+                        "stack": [
+                            {"layer": "Link", "protocol": "Not observed", "detail": "Wi-Fi or Ethernet is selected by the operating system"},
+                            {"layer": "Network", "protocol": "IPv4", "detail": "The transfer socket uses AF_INET"},
+                            {"layer": "Transport", "protocol": "TCP", "detail": "Reliable ordered byte stream; OS controls segment boundaries"},
+                            {"layer": "Application", "protocol": "xdrop v1", "detail": "Encrypted framed records over TCP"},
+                        ],
+                        "security": "X25519 key agreement · HKDF-SHA256 key derivation · AES-256-GCM encryption · SHA-256 file verification",
+                        "handshake_hello_bytes": HANDSHAKE_LEN,
+                        "nonce_bytes": NONCE_LEN,
+                        "length_prefix_bytes": LEN_LEN,
+                        "gcm_tag_bytes": GCM_TAG_LEN,
+                        "encrypted_frame_overhead_bytes": NONCE_LEN + LEN_LEN + GCM_TAG_LEN,
+                        "chunk_size_bytes": CHUNK_SIZE,
+                        "max_full_chunk_frame_bytes": CHUNK_SIZE + NONCE_LEN + LEN_LEN + GCM_TAG_LEN,
+                        "telemetry": telemetry,
+                        "scope_note": "Frame sizes count xdrop application records observed by the sender. They exclude TCP/IP headers, retransmissions, and link-layer frames; TCP may split or combine records.",
+                    },
+                })
+                self._json(200, trace)
+                return
+
             if parsed.path == "/api/history/clear":
                 removed = dashboard.clear_finished_history()
                 self._json(200, {"ok": True, "removed": removed})
@@ -423,17 +627,36 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             if parsed.path == "/api/send":
                 query = parse_qs(parsed.query)
-                address = query.get("address", [""])[0].strip()
-                try:
-                    port = int(query.get("port", [""])[0])
-                except ValueError:
-                    raise ValueError("Choose a valid peer")
-                if not address or not 1 <= port <= 65535:
-                    raise ValueError("Choose a valid peer")
-                peer = parse_peer_endpoint(f"{address}:{port}", port)
-                if not peer:
-                    raise ValueError("Enter a valid IP address or hostname and port")
-                address = peer.address
+                mode = query.get("mode", ["unicast"])[0]
+                if mode not in {"unicast", "multicast", "broadcast"}:
+                    raise ValueError("Choose unicast, multicast, or broadcast delivery")
+                selected_endpoints = query.get("peer", [])
+                if mode == "unicast" and not selected_endpoints:
+                    legacy_address = query.get("address", [""])[0].strip()
+                    legacy_port = query.get("port", [""])[0]
+                    selected_endpoints = [f"{legacy_address}:{legacy_port}"]
+                available_peers = self.server.dashboard.discovery.peers()
+                available = {peer.endpoint: peer for peer in available_peers}
+                if mode == "broadcast":
+                    recipients = list(available.values())
+                elif mode == "multicast":
+                    if not selected_endpoints:
+                        raise ValueError("Select at least one discovered device for multicast")
+                    recipients = []
+                    for endpoint in dict.fromkeys(selected_endpoints):
+                        peer = parse_peer_endpoint(endpoint, 0)
+                        if not peer or peer.endpoint not in available:
+                            raise ValueError("A selected device is no longer available. Refresh and try again")
+                        recipients.append(available[peer.endpoint])
+                else:
+                    if len(selected_endpoints) != 1:
+                        raise ValueError("Unicast needs exactly one device")
+                    peer = parse_peer_endpoint(selected_endpoints[0], 0)
+                    if not peer:
+                        raise ValueError("Enter a valid IP address or hostname and port")
+                    recipients = [peer]
+                if not recipients:
+                    raise ValueError("No nearby xdrop devices are available for this delivery mode")
                 length = int(self.headers.get("Content-Length", "-1"))
                 if length < 0 or length > MAX_UPLOAD_BYTES:
                     raise ValueError("File is too large (maximum 2 GB)")
@@ -452,23 +675,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     # Preserve the browser-provided filename for the transfer offer.
                     renamed_path = temp_path.with_name(temp_path.name + "-" + filename)
                     temp_path.replace(renamed_path)
-                    item: Dict[str, Any] = {
-                        "id": str(time.time_ns()), "filename": filename, "size": length,
-                        "sent": 0, "status": "connecting", "peer": address,
-                        "port": port, "_source_path": str(renamed_path),
-                        "error": None, "started_at": time.time(), "speed_bps": 0,
-                    }
+                    delivery_group = str(time.time_ns()) if len(recipients) > 1 else None
+                    items: list[Dict[str, Any]] = []
+                    for recipient in recipients:
+                        item: Dict[str, Any] = {
+                            "id": str(time.time_ns()), "filename": filename, "size": length,
+                            "sent": 0, "status": "connecting", "peer": recipient.address,
+                            "port": recipient.port, "_source_path": str(renamed_path),
+                            "_delivery_group": delivery_group,
+                            "delivery_mode": mode,
+                            "error": None, "started_at": time.time(), "speed_bps": 0,
+                        }
+                        items.append(item)
                     with dashboard.lock:
-                        dashboard.outgoing.append(item)
+                        dashboard.outgoing.extend(items)
                         dashboard.outgoing = dashboard.outgoing[-100:]
-                    dashboard._start_outgoing(item)
+                    for item in items:
+                        dashboard._start_outgoing(item)
                 except Exception:
                     try:
                         os.unlink(temp_name)
                     except OSError:
                         pass
                     raise
-                self._json(202, {"ok": True, "id": item["id"]})
+                self._json(202, {"ok": True, "ids": [item["id"] for item in items]})
                 return
 
             self._json(404, {"error": "Not found"})

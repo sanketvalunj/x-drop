@@ -69,12 +69,12 @@ def probe_peer(address: str, port: int, timeout: float = 5.0) -> float:
 # ---------------------------------------------------------------------------
 
 def _send_json(ch: SecureChannel, obj: dict) -> None:
-    ch.send(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
+    ch.send(json.dumps(obj, separators=(",", ":")).encode("utf-8"), record_type=str(obj.get("type", "control")))
 
 
 def _recv_json(ch: SecureChannel) -> dict:
     """Receive one encrypted frame and decode it as a JSON object (dict)."""
-    raw = ch.recv()
+    raw = ch.recv(record_type="control")
     parsed = json.loads(raw.decode("utf-8"))
     if not isinstance(parsed, dict):
         raise ValueError(f"expected JSON object, got {type(parsed).__name__}")
@@ -297,6 +297,7 @@ def send_file(
     progress: Optional[Callable[[int, int], None]] = None,
     cancel_event: Optional[threading.Event] = None,
     display_filename: Optional[str] = None,
+    frame_observer: Optional[Callable[[dict], None]] = None,
 ) -> dict:
     """Send `filepath` to peer. Blocking. Returns a result dict.
 
@@ -337,7 +338,7 @@ def send_file(
     ch: Optional[SecureChannel] = None
     try:
         sock.settimeout(30.0)
-        ch = handshake(sock)
+        ch = handshake(sock, frame_observer=frame_observer)
         _send_json(ch, {
             "type": "offer",
             "sender": sender_name[:SENDER_NAME_MAX],
@@ -396,7 +397,7 @@ def send_file(
                 chunk = f.read(CHUNK_SIZE)
                 if not chunk:
                     break
-                ch.send(chunk)
+                ch.send(chunk, record_type="file_chunk")
                 hasher.update(chunk)
                 sent += len(chunk)
                 if progress:
@@ -718,7 +719,7 @@ class ReceiverServer:
                         hasher.update(prefix)
             with temp_path.open("ab" if resume_offset else "wb") as out:
                 while received < size:
-                    frame = ch.recv()
+                    frame = ch.recv(record_type="file_chunk")
                     if not frame:
                         continue
                     remaining = size - received
