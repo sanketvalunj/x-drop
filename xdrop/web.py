@@ -19,7 +19,7 @@ from . import __version__
 from .config import Config
 from .discovery import DiscoveryService, _primary_ipv4, parse_peer_endpoint
 from .logger import init_logging
-from .transfer import IncomingTransfer, ReceiverServer, sanitize_filename, send_file
+from .transfer import CHUNK_SIZE, IncomingTransfer, ReceiverServer, probe_peer, sanitize_filename, send_file
 
 try:
     import qrcode
@@ -45,6 +45,9 @@ def _transfer_data(transfer: IncomingTransfer) -> dict:
         "save_path": str(transfer.save_path) if transfer.save_path else None,
         "error": transfer.error,
         "speed_bps": transfer.speed_bps,
+        "duration_s": transfer.duration_s,
+        "throughput_bps": transfer.speed_bps if transfer.status == "done" else None,
+        "resumed_bytes": transfer.resume_offset,
         "started_at": transfer.started_at,
     }
 
@@ -66,6 +69,7 @@ class Dashboard:
         self.discovery.start()
         self.outgoing: list[dict] = []
         self.cancel_events: Dict[str, threading.Event] = {}
+        self.quality: Dict[str, dict] = {}
         self.lock = threading.Lock()
 
     def state(self) -> dict:
@@ -88,12 +92,39 @@ class Dashboard:
             "qr_available": HAS_QR,
             "discovery": diagnostics,
             "peers": [
-                {"name": peer.name, "address": peer.address, "port": peer.port}
+                {"name": peer.name, "address": peer.address, "port": peer.port, "last_seen": peer.last_seen,
+                 "quality": self.quality.get(f"{peer.address}:{peer.port}")}
                 for peer in self.discovery.peers()
+            ],
+            "discovered_peers": [
+                {"name": peer.name, "address": peer.address, "port": peer.port,
+                 "last_seen": peer.last_seen, "online": peer.online,
+                 "quality": self.quality.get(f"{peer.address}:{peer.port}")}
+                for peer in self.discovery.discovered_peers()
             ],
             "incoming": incoming,
             "outgoing": outgoing,
+            "protocol": {"version": 1, "chunk_size": CHUNK_SIZE, "handshake": "X25519 + HKDF-SHA256", "cipher": "AES-256-GCM", "integrity": "SHA-256"},
         }
+
+    def check_peer_quality(self, address: str, port: int) -> dict:
+        endpoint = f"{address}:{port}"
+        checked_at = time.time()
+        try:
+            latency_ms = probe_peer(address, port)
+            success, error = True, None
+        except Exception as exc:
+            latency_ms = None
+            success, error = False, str(exc)
+        with self.lock:
+            record = self.quality.setdefault(endpoint, {"attempts": 0, "successes": 0, "last_ms": None, "last_checked": None, "error": None})
+            record["attempts"] += 1
+            record["successes"] += int(success)
+            record["last_ms"] = latency_ms
+            record["last_checked"] = checked_at
+            record["error"] = error
+            record["success_rate"] = record["successes"] / record["attempts"] * 100
+            return dict(record)
 
     def stop(self) -> None:
         self.discovery.stop()
@@ -117,6 +148,10 @@ class Dashboard:
             if not source.is_file():
                 return False
             item["sent"] = 0
+            item["resumed_bytes"] = 0
+            item["speed_bps"] = 0
+            item["duration_s"] = None
+            item["throughput_bps"] = None
             item["status"] = "connecting"
             item["error"] = None
             item["started_at"] = time.time()
@@ -129,16 +164,23 @@ class Dashboard:
             self.cancel_events[item["id"]] = cancel_event
         def worker() -> None:
             progress_started = None
+            progress_last_at = None
+            resumed_bytes = None
             def progress(sent: int, total: int) -> None:
-                nonlocal progress_started
+                nonlocal progress_started, progress_last_at, resumed_bytes
                 now = time.time()
                 if progress_started is None:
                     progress_started = now
+                    resumed_bytes = sent
+                progress_last_at = now
                 with self.lock:
                     item["sent"] = sent
                     item["size"] = total
+                    item["resumed_bytes"] = resumed_bytes or 0
                     item["status"] = "sending"
-                    item["speed_bps"] = sent / max(now - progress_started, 0.001)
+                    elapsed = max(now - progress_started, 0.001)
+                    item["speed_bps"] = max(0, sent - (resumed_bytes or 0)) / elapsed
+                    item["duration_s"] = elapsed
             try:
                 result = send_file(
                     item["peer"], item["port"], Path(item["_source_path"]),
@@ -150,6 +192,15 @@ class Dashboard:
                         "cancelled" if result.get("reason") == "transfer cancelled by user" else "failed"
                     )
                     item["error"] = result.get("reason") or None
+                    item["resumed_bytes"] = int(resumed_bytes or 0)
+                    item["duration_s"] = max(0.0, progress_last_at - progress_started) if progress_started and progress_last_at else None
+                    duration = item["duration_s"]
+                    item["throughput_bps"] = (
+                        max(0, int(result.get("bytes_sent", 0)) - item["resumed_bytes"]) / duration
+                        if result.get("ok") and duration else None
+                    )
+                    if duration and item["throughput_bps"] is not None:
+                        item["speed_bps"] = item["throughput_bps"]
                     if result.get("ok"):
                         try:
                             Path(item["_source_path"]).unlink(missing_ok=True)
@@ -214,7 +265,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'")
+        # Inline style attributes drive measured progress/chart widths. Allowing
+        # inline styles does not enable inline JavaScript under this policy.
+        self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(data)
 
@@ -322,6 +375,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if not peer:
                     raise ValueError("That address or port is not valid. Check both and try again.")
                 self._json(200, {"ok": True, "address": peer.address, "port": peer.port, "label": f"{peer.address}:{peer.port}"})
+                return
+
+            if parsed.path == "/api/quality":
+                endpoint = str(self._read_json().get("endpoint", "")).strip()
+                peer = parse_peer_endpoint(endpoint, 0)
+                if not peer:
+                    raise ValueError("Enter a valid peer address and port")
+                self._json(200, dashboard.check_peer_quality(peer.address, peer.port))
                 return
 
             if parsed.path == "/api/history/clear":

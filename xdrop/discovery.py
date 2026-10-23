@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import socket
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -38,6 +39,8 @@ class Peer:
     service: str        # full zeroconf service name (unique key)
     address: str        # IPv4 string
     port: int
+    last_seen: float = 0.0
+    online: bool = True
 
     @property
     def endpoint(self) -> str:
@@ -104,8 +107,9 @@ def parse_peer_endpoint(endpoint: str, default_port: int) -> Optional[Peer]:
 
 
 class _Listener(ServiceListener):
-    def __init__(self, peers: Dict[str, Peer], get_self_service, lock: threading.Lock):
+    def __init__(self, peers: Dict[str, Peer], peer_history: Dict[str, Peer], get_self_service, lock: threading.Lock):
         self._peers = peers
+        self._peer_history = peer_history
         self._get_self = get_self_service
         self._lock = lock
 
@@ -128,9 +132,17 @@ class _Listener(ServiceListener):
             except Exception:
                 txt_name = None
             display = txt_name or name.split("." + SERVICE_TYPE[:-1].lstrip("_"))[0].rstrip(".")
-            peer = Peer(name=display, service=name, address=addrs[0], port=info.port or 0)
+            peer = Peer(name=display, service=name, address=addrs[0], port=info.port or 0, last_seen=time.time())
             with self._lock:
                 self._peers[name] = peer
+                self._peer_history[name] = peer
+                if len(self._peer_history) > 100:
+                    offline = sorted(
+                        (entry for key, entry in self._peer_history.items() if key not in self._peers),
+                        key=lambda entry: entry.last_seen,
+                    )
+                    for entry in offline[:max(0, len(self._peer_history) - 100)]:
+                        self._peer_history.pop(entry.service, None)
             log.debug(f"Discovered peer {peer.name} @ {peer.endpoint}")
         except Exception as e:
             log.warning(f"Error refreshing service {name}: {e}")
@@ -145,6 +157,9 @@ class _Listener(ServiceListener):
         try:
             with self._lock:
                 removed = self._peers.pop(name, None)
+                if removed:
+                    removed.online = False
+                    self._peer_history[name] = removed
             if removed:
                 log.debug(f"Peer removed: {removed.name} ({name})")
         except Exception as e:
@@ -161,6 +176,7 @@ class DiscoveryService:
         self._info: Optional[ServiceInfo] = None
         self._browser: Optional[ServiceBrowser] = None
         self._peers: Dict[str, Peer] = {}
+        self._peer_history: Dict[str, Peer] = {}
         self._lock = threading.Lock()
         self._service_name = self._make_service_name(device_name)
         # Diagnostics surfaced to the CLI for friendly warnings.
@@ -214,7 +230,7 @@ class DiscoveryService:
             self.last_error = f"service register failed: {e}"
             log.warning(f"mDNS service register failed: {e}")
 
-        listener = _Listener(self._peers, lambda: self._service_name, self._lock)
+        listener = _Listener(self._peers, self._peer_history, lambda: self._service_name, self._lock)
         try:
             self._browser = ServiceBrowser(self._zc, SERVICE_TYPE, listener)
             log.info(f"mDNS browser started for {SERVICE_TYPE}")
@@ -257,7 +273,7 @@ class DiscoveryService:
                 self._browser.cancel()
         except Exception:
             pass
-        listener = _Listener(self._peers, lambda: self._service_name, self._lock)
+        listener = _Listener(self._peers, self._peer_history, lambda: self._service_name, self._lock)
         try:
             self._browser = ServiceBrowser(self._zc, SERVICE_TYPE, listener)
         except Exception as e:
@@ -266,6 +282,11 @@ class DiscoveryService:
     def peers(self) -> List[Peer]:
         with self._lock:
             return sorted(self._peers.values(), key=lambda p: p.name.lower())
+
+    def discovered_peers(self) -> List[Peer]:
+        """Return peers seen during this run, including those now offline."""
+        with self._lock:
+            return sorted(self._peer_history.values(), key=lambda p: p.name.lower())
 
     def diagnostics(self) -> dict:
         with self._lock:

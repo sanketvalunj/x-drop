@@ -103,7 +103,7 @@ def _welcome_panel() -> Panel:
     body = Text.from_markup(
         f"[bold cyan]{APP_NAME}[/bold cyan]  [dim]v{__version__}[/dim]\n"
         f"{TAGLINE}\n"
-        f"[green]🔒 End-to-end encrypted[/green] · "
+        f"[green]🔒 Encrypted transport[/green] · "
         f"[magenta]🛰  LAN auto-discovery[/magenta] · "
         f"[yellow]⚡ no setup[/yellow]\n"
         f"[dim]{CREDIT}[/dim]"

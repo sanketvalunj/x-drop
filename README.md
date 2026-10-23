@@ -7,7 +7,7 @@
 > Peer-to-peer encrypted file sharing for your local network, with a terminal and a clean web dashboard.
 
 - 🛰  **Auto-discovery** on the LAN (zeroconf / mDNS)
-- 🔒 **End-to-end encryption** every session — X25519 ECDH + AES-256-GCM
+- 🔒 **Encrypted transport** every session — ephemeral X25519 ECDH + AES-256-GCM
 - ✅ **SHA-256 integrity verification** on every transfer
 - ⚡ **Zero setup** — no internet, no cloud, no accounts, no admin/root, no pre-shared passwords
 - ✨ **Premium TUI** — rich panels, live discovery, progress, speed, ETA
@@ -72,6 +72,7 @@ Received files land in `~/xdrop_files/` by default.
   firewall, manual Direct IP/Port mode is automatically available as a fallback.
 - **Transport**: a fresh TCP socket per session with bounded concurrency (up to 4 concurrent transfers).
 - **Handshake**: X25519 ECDH → HKDF-SHA256 → 32-byte AES key.
+- **Peer authentication**: peers are not authenticated or pinned. Encryption protects traffic from passive network observers, but does not prevent an active machine-in-the-middle on the LAN.
 - **Stream**: each frame is `[12-byte nonce][4-byte length][AES-256-GCM ciphertext]`.
 - **Resumable staging & Integrity**: incoming files are streamed into a temporary `.part` file.
   The offer includes the file size and SHA-256 identity; a retry of the same file resumes from

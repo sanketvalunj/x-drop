@@ -47,6 +47,23 @@ MAX_CONCURRENT_SESSIONS = 4 # maximum simultaneous incoming transfers
 MAX_HISTORY = 100           # maximum retained transfers in memory
 
 
+def probe_peer(address: str, port: int, timeout: float = 5.0) -> float:
+    """Return TCP connect and encrypted probe round-trip time in milliseconds."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    started = time.perf_counter()
+    try:
+        sock.connect((address, port))
+        channel = handshake(sock)
+        _send_json(channel, {"type": "probe"})
+        response = _recv_json(channel)
+        if response.get("type") != "probe_ack":
+            raise ConnectionError(response.get("reason") or "peer did not acknowledge probe")
+        return (time.perf_counter() - started) * 1000
+    finally:
+        sock.close()
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -62,6 +79,15 @@ def _recv_json(ch: SecureChannel) -> dict:
     if not isinstance(parsed, dict):
         raise ValueError(f"expected JSON object, got {type(parsed).__name__}")
     return parsed
+
+
+def _integrity_failure(actual_sha: str, expected_sha: Optional[str], offered_sha: Optional[str] = None) -> Optional[str]:
+    """Return a clear failure reason unless the complete payload is verified."""
+    if not expected_sha or not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+        return "integrity check failed (missing or invalid SHA-256 digest)"
+    if actual_sha != expected_sha or (offered_sha is not None and actual_sha != offered_sha):
+        return "integrity check failed (sha256 mismatch)"
+    return None
 
 
 _WIN_RESERVED = {
@@ -165,6 +191,8 @@ class IncomingTransfer:
         self.size = size
         self.started_at = started_at
         self.resume_offset = resume_offset
+        self.data_started_at: Optional[float] = None
+        self.duration_s: Optional[float] = None
         self._status = STATUS_PENDING
         self._received = 0
         self._save_path: Optional[Path] = None
@@ -250,11 +278,11 @@ class IncomingTransfer:
     @property
     def speed_bps(self) -> float:
         with self._lock:
-            if not self._received or not self.started_at:
+            if not self._received or not self.data_started_at:
                 return 0.0
             end = self._finished_at or time.time()
-            elapsed = max(end - self.started_at, 1e-6)
-            return self._received / elapsed
+            elapsed = max(end - self.data_started_at, 1e-6)
+            return max(0, self._received - self.resume_offset) / elapsed
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +582,9 @@ class ReceiverServer:
             conn.settimeout(30.0)
             ch = handshake(conn)
             offer = _recv_json(ch)
+            if offer.get("type") == "probe":
+                _send_json(ch, {"type": "probe_ack"})
+                return
             if offer.get("type") != "offer":
                 log.warning(f"Expected offer message from {sender_addr}, got: {offer.get('type')}")
                 return
@@ -666,6 +697,7 @@ class ReceiverServer:
             temp_path = part_path if resumable and part_path else dest_dir / f".xdrop_tmp_{t.id}.part"
             t.temp_path = temp_path
             t.status = STATUS_ACTIVE
+            t.data_started_at = time.time()
             if self.on_update:
                 self.on_update(t)
             if resumable and meta_path:
@@ -709,15 +741,17 @@ class ReceiverServer:
             except Exception as e:
                 log.warning(f"Error receiving done frame for {t.id}: {e}")
 
+            actual_sha = hasher.hexdigest()
             if received < size:
                 t.status = STATUS_FAILED
                 t.error = f"truncated: got {received}/{size} bytes"
                 log.error(f"Transfer {t.id} truncated: {received}/{size} bytes")
-            elif ((expected_sha and hasher.hexdigest() != expected_sha)
-                  or (resumable and hasher.hexdigest() != offered_digest)):
+            elif (integrity_error := _integrity_failure(
+                actual_sha, expected_sha, offered_digest if resumable else None
+            )):
                 t.status = STATUS_FAILED
-                t.error = "integrity check failed (sha256 mismatch)"
-                log.error(f"Transfer {t.id} sha256 mismatch (expected {expected_sha}, computed {hasher.hexdigest()})")
+                t.error = integrity_error
+                log.error(f"Transfer {t.id} {integrity_error} (expected {expected_sha}, computed {actual_sha})")
                 try:
                     _send_json(ch, {"type": "ack", "ok": False, "reason": t.error})
                 except Exception:
@@ -731,7 +765,7 @@ class ReceiverServer:
                     meta_path.unlink(missing_ok=True)
                 t.save_path = final_path
                 t.status = STATUS_DONE
-                t.verified = bool(expected_sha and hasher.hexdigest() == expected_sha and (not resumable or hasher.hexdigest() == offered_digest))
+                t.verified = True
                 log.info(f"Transfer {t.id} verified and saved to {final_path}")
                 try:
                     _send_json(ch, {"type": "ack", "ok": True})
@@ -739,6 +773,8 @@ class ReceiverServer:
                     pass
 
             t.finished_at = time.time()
+            if t.data_started_at:
+                t.duration_s = max(0.0, t.finished_at - t.data_started_at)
             if self.on_update:
                 self.on_update(t)
         except Exception as e:

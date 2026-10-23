@@ -40,11 +40,11 @@ async function request(path, options = {}) {
   return data;
 }
 function deviceRow(peer, compact = false) {
-  return `<div class="device-row"><div class="device-avatar">${escapeHTML((peer.name || '?').slice(0,1).toUpperCase())}</div><div class="device-info"><strong>${escapeHTML(peer.name)}</strong><span>${escapeHTML(peer.address)} · online now</span></div><button class="button button-secondary button-small" data-send-peer="${escapeHTML(peer.address)}:${peer.port}">Send file <span>↗</span></button></div>`;
+  return `<div class="device-row"><div class="device-avatar">${escapeHTML((peer.name || '?').slice(0,1).toUpperCase())}</div><div class="device-info"><strong>${escapeHTML(peer.name)}</strong><span>${escapeHTML(peer.address)} · last seen ${peer.last_seen ? timeLabel(peer.last_seen) : 'time unavailable'}</span></div><button class="button button-secondary button-small" data-send-peer="${escapeHTML(peer.address)}:${peer.port}">Send file <span>↗</span></button></div>`;
 }
 function incomingCard(item) {
   const pending = item.status === 'pending';
-  const status = item.status === 'active' ? `${size(item.received)} of ${size(item.size)} received` : `${item.status}${item.verified ? ' · verified' : ''}`;
+  const status = `${item.status === 'active' ? `${size(item.received)} of ${size(item.size)} received` : `${item.status}${item.verified ? ' · SHA-256 verified' : ''}`}${Number(item.resumed_bytes) > 0 ? ` · resumed ${size(item.resumed_bytes)}` : ''}`;
   return `<div class="incoming-card"><div class="device-avatar">↓</div><div class="incoming-info"><strong>${escapeHTML(item.filename)}</strong><span>${escapeHTML(item.sender)} · ${size(item.size)} · ${escapeHTML(item.address || '')}</span><span class="status-text ${item.status === 'failed' ? 'failed' : item.status === 'done' ? 'done' : ''}">${escapeHTML(status)}</span></div>${pending ? `<div class="incoming-actions"><button class="button button-secondary" data-decision="accept" data-id="${escapeHTML(item.id)}">Accept</button><button class="button button-quiet" data-decision="reject" data-id="${escapeHTML(item.id)}">Decline</button></div>` : ''}</div>`;
 }
 function transferCard(item, direction) {
@@ -56,7 +56,8 @@ function transferCard(item, direction) {
   const eta = speed > 0 ? ` · ${Math.ceil(Math.max(0,total-sent)/speed)}s left` : '';
   const status = item.status === 'done' ? 'Complete' : item.status === 'cancelled' ? 'Cancelled' : item.status === 'failed' ? (item.error || 'Failed') : item.status === 'connecting' ? 'Waiting for receiver' : `${percent}% · ${size(speed)}/s${eta}`;
   const mark = item.status === 'done' ? '✓' : item.status === 'failed' ? '!' : item.status === 'cancelled' ? '×' : '⇅';
-  return `<div class="file-card"><div class="file-icon">${mark}</div><div class="file-meta"><strong>${escapeHTML(item.filename)}</strong><span>${direction === 'out' ? `To ${escapeHTML(item.peer)}` : `From ${escapeHTML(item.sender)}`} · ${size(total)}${item.error ? ` · ${escapeHTML(item.error)}` : ''}</span>${!done ? `<div class="progress-wrap"><i style="width:${percent}%"></i></div>` : ''}</div><div class="transfer-status">${escapeHTML(status)}</div>${item.can_cancel ? `<button class="button button-danger button-small" data-cancel-transfer="${escapeHTML(item.id)}">Cancel</button>` : ''}${direction === 'out' && item.can_resume ? `<button class="button button-secondary button-small" data-resume-transfer="${escapeHTML(item.id)}">Resume</button>` : ''}</div>`;
+  const details = [Number(item.resumed_bytes) > 0 ? `resumed ${size(item.resumed_bytes)}` : '', item.status === 'done' && Number(item.throughput_bps) > 0 ? `${size(item.throughput_bps)}/s avg` : '', item.verified ? 'SHA-256 verified' : ''].filter(Boolean).join(' · ');
+  return `<div class="file-card"><div class="file-icon">${mark}</div><div class="file-meta"><strong>${escapeHTML(item.filename)}</strong><span>${direction === 'out' ? `To ${escapeHTML(item.peer)}` : `From ${escapeHTML(item.sender)}`} · ${size(total)}${details ? ` · ${escapeHTML(details)}` : ''}${item.error ? ` · ${escapeHTML(item.error)}` : ''}</span>${!done ? `<div class="progress-wrap"><i style="width:${percent}%"></i></div>` : ''}</div><div class="transfer-status">${escapeHTML(status)}</div>${item.can_cancel ? `<button class="button button-danger button-small" data-cancel-transfer="${escapeHTML(item.id)}">Cancel</button>` : ''}${direction === 'out' && item.can_resume ? `<button class="button button-secondary button-small" data-resume-transfer="${escapeHTML(item.id)}">Resume</button>` : ''}</div>`;
 }
 function heading(kicker, title, subtitle, action = '') {
   return `<div class="page-heading"><div><div class="eyebrow">${kicker}</div><h1>${title}</h1><p>${subtitle}</p></div>${action}</div>`;
@@ -68,7 +69,7 @@ function overview() {
   const activity = [...(state.outgoing || []).map(item => ({...item, direction:'out'})), ...incoming.map(item => ({...item, direction:'in'}))].sort((a,b) => (b.started_at || 0) - (a.started_at || 0)).slice(0,4);
   const activityHTML = activity.length ? activity.map(item => `<div class="activity-row"><div class="activity-mark">${item.status === 'done' ? '✓' : item.direction === 'out' ? '↑' : '↓'}</div><div class="activity-info"><strong>${escapeHTML(item.filename)}</strong><span>${item.direction === 'out' ? `To ${escapeHTML(item.peer)}` : `From ${escapeHTML(item.sender)} `} · ${timeLabel(item.started_at)}</span><div class="status-text ${item.status === 'done' ? 'done' : item.status === 'failed' ? 'failed' : ''}">${escapeHTML(item.status)}</div></div></div>`).join('') : `<div class="empty"><strong>Nothing shared yet</strong>Your recent file activity will show up here.</div>`;
   return `${heading('YOUR SPACE',`Welcome back, ${escapeHTML(state.device_name)}`, 'Your files move directly between devices on your network.', '<button class="button button-quiet" data-action="refresh">↻ &nbsp;Refresh</button>')}
-    <section class="hero"><div class="hero-copy"><div class="hero-kicker"><i></i> Private by design</div><h2>Share files. Stay in sync.</h2><p>Send files directly to devices on your local network. Every transfer is encrypted and verified.</p><button class="button" data-action="send"><span class="plus">＋</span> Send a file</button></div><div class="hero-art"><div class="orbit"></div><div class="orbit two"></div><i class="orbit-dot"></i><div class="art-core">⇄</div></div></section>
+    <section class="hero"><div class="hero-copy"><div class="hero-kicker"><i></i> Encrypted in transit</div><h2>Share files. Stay in sync.</h2><p>Send files directly to devices on your local network. Transfers are encrypted and SHA-256 checked.</p><button class="button" data-action="send"><span class="plus">＋</span> Send a file</button></div><div class="hero-art"><div class="orbit"></div><div class="orbit two"></div><i class="orbit-dot"></i><div class="art-core">⇄</div></div></section>
     <div class="stat-grid"><div class="stat-card"><div class="stat-icon">◉</div><div class="stat-text"><span>DEVICES NEARBY</span><strong>${peers.length} online</strong></div></div><div class="stat-card"><div class="stat-icon">↓</div><div class="stat-text"><span>NEEDS YOUR ATTENTION</span><strong>${pending.length} incoming</strong></div></div><div class="stat-card"><div class="stat-icon">▤</div><div class="stat-text"><span>SAVING FILES TO</span><strong title="${escapeHTML(state.download_dir)}">${escapeHTML(state.download_dir.split('/').pop() || state.download_dir)}</strong></div></div></div>
     ${pending.length ? `<section class="section-block"><div class="section-head"><h2>Incoming requests <span class="nav-count">${pending.length}</span></h2><button class="text-link" data-view="transfers">View all</button></div>${pending.map(incomingCard).join('')}</section>` : ''}
     <div class="columns"><section><div class="section-head"><h2>Devices nearby</h2><button class="text-link" data-view="devices">See all</button></div><div class="card device-list">${peers.length ? peers.slice(0,4).map(peer => deviceRow(peer,true)).join('') : `<div class="empty"><div class="empty-mark">◉</div><strong>No devices found yet</strong>Make sure your other device is on the same Wi-Fi network.</div>`}</div></section><section><div class="section-head"><h2>Recent activity</h2><button class="text-link" data-view="transfers">History</button></div><div class="card activity-list">${activityHTML}</div></section></div>`;
@@ -99,6 +100,83 @@ function transfersView() {
     <div class="history-toolbar"><label class="history-search"><span>⌕</span><input id="history-search" type="search" placeholder="Search files or devices" value="${escapeHTML(historySearch)}"></label><select id="history-direction" aria-label="Filter by direction"><option value="all" ${historyDirection==='all'?'selected':''}>All directions</option><option value="incoming" ${historyDirection==='incoming'?'selected':''}>Incoming</option><option value="outgoing" ${historyDirection==='outgoing'?'selected':''}>Outgoing</option></select><select id="history-status" aria-label="Filter by status"><option value="all" ${historyStatus==='all'?'selected':''}>All statuses</option>${['pending','active','done','failed','rejected','cancelled'].map(value=>`<option value="${value}" ${historyStatus===value?'selected':''}>${value[0].toUpperCase()+value.slice(1)}</option>`).join('')}</select></div>
     <div class="history-list">${content}<div class="card empty history-no-results" hidden><strong>No matching transfers</strong>Try another search or filter.</div></div><div class="transfer-footer"><button class="text-link" data-action="send">Send a file ↗</button><span>Active and pending transfers stay when you clear history.</span></div>`;
 }
+function allTransfers() {
+  return [
+    ...(state.incoming || []).map(item => ({...item, direction:'incoming'})),
+    ...(state.outgoing || []).map(item => ({...item, direction:'outgoing'})),
+  ];
+}
+function trafficView() {
+  const transfers = allTransfers();
+  const completed = transfers.filter(item => item.status === 'done');
+  const activeCount = transfers.filter(item => ['active','sending','connecting'].includes(item.status)).length;
+  const totalBytes = completed.reduce((sum, item) => sum + Math.max(0, Number(item.size) || 0), 0);
+  const today = new Date();
+  today.setHours(0,0,0,0);
+  const days = Array.from({length:7}, (_, index) => {
+    const date = new Date(today);
+    date.setDate(today.getDate() - (6 - index));
+    const key = `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
+    const daily = completed.filter(item => {
+      const stamp = Number(item.started_at);
+      if (!Number.isFinite(stamp) || stamp <= 0) return false;
+      const transferDate = new Date(stamp * 1000);
+      return `${transferDate.getFullYear()}-${transferDate.getMonth()}-${transferDate.getDate()}` === key;
+    });
+    return {date, label:date.toLocaleDateString(undefined,{weekday:'short'}), bytes:daily.reduce((sum,item)=>sum + Math.max(0,Number(item.size)||0),0), count:daily.length};
+  });
+  const peak = Math.max(0, ...days.map(day => day.bytes));
+  const dailyBars = days.map(day => {
+    const height = peak ? Math.round(day.bytes / peak * 100) : 0;
+    return `<div class="traffic-day" title="${escapeHTML(day.date.toLocaleDateString())}: ${size(day.bytes)} across ${day.count} completed ${day.count === 1 ? 'transfer' : 'transfers'}"><div class="traffic-bar-track"><i style="height:${height}%"></i></div><strong>${day.bytes ? size(day.bytes) : '—'}</strong><span>${day.label}</span></div>`;
+  }).join('');
+  const byDirection = ['incoming','outgoing'].map(direction => ({
+    direction,
+    bytes: completed.filter(item => item.direction === direction).reduce((sum,item)=>sum + Math.max(0,Number(item.size)||0),0),
+    count: completed.filter(item => item.direction === direction).length,
+  }));
+  const directionRows = byDirection.map(item => {
+    const percent = totalBytes ? Math.round(item.bytes / totalBytes * 100) : 0;
+    const name = item.direction === 'incoming' ? 'Received' : 'Sent';
+    return `<div class="traffic-direction"><div class="traffic-direction-head"><strong>${name}</strong><span>${size(item.bytes)} · ${item.count} ${item.count === 1 ? 'transfer' : 'transfers'}</span></div><div class="traffic-progress"><i class="${item.direction}" style="width:${percent}%"></i></div></div>`;
+  }).join('');
+  const hasCompleted = completed.length > 0;
+  return `${heading('NETWORK ACTIVITY','Traffic analysis','Actual completed transfers recorded by this xdrop session.')}
+    <div class="traffic-note">Traffic totals use completed transfers only. History is kept in memory while this dashboard is running.</div>
+    <div class="stat-grid traffic-stats"><div class="stat-card"><div class="stat-icon">⇅</div><div class="stat-text"><span>COMPLETED DATA</span><strong>${size(totalBytes)}</strong></div></div><div class="stat-card"><div class="stat-icon">✓</div><div class="stat-text"><span>COMPLETED TRANSFERS</span><strong>${completed.length}</strong></div></div><div class="stat-card"><div class="stat-icon">↻</div><div class="stat-text"><span>ACTIVE NOW</span><strong>${activeCount}</strong></div></div></div>
+    <div class="traffic-grid"><section class="card traffic-chart-card"><div class="section-head"><div><h2>Completed traffic</h2><span class="traffic-caption">Completed file size by start date · last 7 days</span></div></div>${hasCompleted ? `<div class="traffic-chart">${dailyBars}</div><div class="traffic-axis"><span>Older</span><span>Today</span></div>` : `<div class="traffic-empty">No completed transfers recorded in this session yet.</div>`}</section>
+    <section class="card traffic-chart-card"><div class="section-head"><div><h2>By direction</h2><span class="traffic-caption">Completed data sent and received</span></div></div>${hasCompleted ? `<div class="traffic-directions">${directionRows}</div>` : `<div class="traffic-empty">Direction totals will appear after a transfer completes.</div>`}</section></div>`;
+}
+function insightsView() {
+  const samples = allTransfers().filter(item => item.status === 'done' && Number(item.throughput_bps) > 0);
+  const buckets = [
+    {label:'Small', range:'Under 1 MB', test:n=>n < 1024**2},
+    {label:'Medium', range:'1–100 MB', test:n=>n >= 1024**2 && n < 100*1024**2},
+    {label:'Large', range:'100 MB+', test:n=>n >= 100*1024**2},
+  ].map(bucket => {
+    const matches = samples.filter(item => bucket.test(Number(item.size) || 0));
+    return {...bucket, count:matches.length, avg:matches.length ? matches.reduce((sum,item)=>sum + Number(item.throughput_bps),0)/matches.length : 0};
+  });
+  const maxThroughput = Math.max(0,...buckets.map(bucket=>bucket.avg));
+  const peers = state.discovered_peers || state.peers || [];
+  const peerRows = peers.length ? peers.map(peer => {
+    const quality = peer.quality;
+    const online = peer.online !== false;
+    return `<div class="insight-peer ${online ? '' : 'offline'}"><div class="device-avatar">${escapeHTML((peer.name || '?').slice(0,1).toUpperCase())}</div><div class="device-info"><strong>${escapeHTML(peer.name)} <small class="peer-state ${online ? 'online' : ''}">${online ? 'Online' : 'Offline'}</small></strong><span>${escapeHTML(peer.address)}:${peer.port} · last seen ${peer.last_seen ? timeLabel(peer.last_seen) : 'time unavailable'}</span>${quality ? `<small class="quality-result ${quality.last_ms == null ? 'failed' : ''}">${quality.last_ms == null ? 'Last probe failed' : `${Number(quality.last_ms).toFixed(1)} ms connect + secure probe`} · ${quality.successes}/${quality.attempts} probes succeeded (${Math.round(quality.success_rate)}%)</small>` : '<small class="quality-result">No connection probes yet</small>'}</div>${online ? `<button class="button button-quiet button-small" data-quality="${escapeHTML(peer.address)}:${peer.port}">Check</button>` : ''}</div>`;
+  }).join('') : `<div class="insight-empty">No devices discovered during this session.</div>`;
+  const protocol = state.protocol || {};
+  const performanceRows = buckets.map(bucket => `<div class="performance-row"><div><strong>${bucket.label}</strong><span>${bucket.range} · ${bucket.count} ${bucket.count === 1 ? 'sample' : 'samples'}</span></div><div class="performance-meter"><i style="width:${maxThroughput ? Math.round(bucket.avg/maxThroughput*100) : 0}%"></i></div><b>${bucket.count ? `${size(bucket.avg)}/s` : 'No data'}</b></div>`).join('');
+  const flow = [
+    ['1','Secure handshake',protocol.handshake || 'X25519 + HKDF-SHA256','Fresh key for each connection'],
+    ['2','Encrypted stream',protocol.cipher || 'AES-256-GCM',`${size(protocol.chunk_size || 65536)} chunks over TCP`],
+    ['3','Integrity check',protocol.integrity || 'SHA-256','Receiver verifies before saving'],
+    ['4','Resume if interrupted','Stable file identity','Continue partial file; verify full SHA-256 after resume'],
+  ].map(step=>`<div class="protocol-step"><span>${step[0]}</span><div><strong>${escapeHTML(step[1])}</strong><b>${escapeHTML(step[2])}</b><small>${escapeHTML(step[3])}</small></div></div>`).join('');
+  return `${heading('NETWORK INSIGHTS','Performance & connection','Measured transfer performance, peer reachability, and the protocol used by xdrop.')}
+    <section class="card insight-section"><div class="section-head"><div><h2>Throughput by file size</h2><span class="traffic-caption">Average measured payload rate for completed transfers in this session</span></div></div>${samples.length ? `<div class="performance-list">${performanceRows}</div>` : `<div class="insight-empty">No completed transfer has a measured throughput yet. Send or receive a file to build a real comparison.</div>`}</section>
+    <section class="card insight-section"><div class="section-head"><div><h2>Connection quality</h2><span class="traffic-caption">Latency includes TCP connect, secure handshake, and an encrypted probe reply. Success rate counts checks you run here.</span></div></div><div class="insight-peers">${peerRows}</div></section>
+    <section class="card insight-section"><div class="section-head"><div><h2>Transfer protocol</h2><span class="traffic-caption">Actual transfer sequence and safeguards</span></div></div><div class="protocol-flow">${flow}</div></section>`;
+}
 function applyHistoryFilters() {
   const rows = [...root.querySelectorAll('.history-row')];
   if (!rows.length) return;
@@ -118,11 +196,11 @@ function settingsView() {
     <div class="settings-grid"><section class="setting-card"><h3>This device</h3><p>Your device name is shown to nearby xdrop users.</p><form id="name-form"><div class="field"><label for="device-name">DEVICE NAME</label><input id="device-name" maxlength="48" required value="${escapeHTML(state.device_name)}"></div><button class="button button-primary" type="submit">Save name</button></form></section>
     <section class="setting-card"><h3>Download location</h3><p>Received files are saved to this folder.</p><form id="folder-form"><div class="field"><label for="download-dir">FOLDER PATH</label><input id="download-dir" required value="${escapeHTML(state.download_dir)}"></div><div class="form-actions"><button class="button button-primary" type="submit">Save location</button><button class="button button-quiet" type="button" data-action="open-folder">Open folder ↗</button></div></form></section>
     <section class="setting-card"><h3>Pair another device</h3><p>Share your code, or scan a nearby xdrop code with this device’s camera.</p>${state.qr_available && state.local_ip ? `<div class="pairing-qr"><img src="/api/pairing.svg" alt="QR code for ${escapeHTML(state.local_ip)}:${state.port}"><div><strong>${escapeHTML(state.device_name)}</strong><span>Another device can scan this code and connect.</span><button class="button button-secondary button-small" type="button" data-action="scan-qr">▦ Scan a code</button></div></div>` : `<div class="qr-unavailable">${!state.qr_available ? 'Install xdrop dependencies to enable QR pairing.' : 'No local network address was detected.'}<button class="button button-secondary button-small" type="button" data-action="scan-qr">▦ Scan a code</button></div>`}<div class="copy-address-row"><div><span>Address and port</span><strong>${escapeHTML(state.local_ip ? `${state.local_ip}:${state.port}` : 'Address not detected')}</strong></div><button class="button button-quiet button-small" data-copy-address="${escapeHTML(state.local_ip ? `${state.local_ip}:${state.port}` : '')}" ${state.local_ip ? '' : 'disabled'}>Copy</button></div><div class="network-info"><span>Discovery</span><strong>${state.discovery.registered ? 'Available' : 'Limited'}</strong></div></section>
-    <section class="setting-card"><h3>Privacy & security</h3><p>Each transfer uses a fresh encrypted connection and verifies file integrity before saving.</p><div class="security-line"><span class="security-check">✓</span><span><strong>End-to-end encrypted</strong><small>X25519 · AES-256-GCM · SHA-256</small></span></div></section></div>`;
+    <section class="setting-card"><h3>Privacy & security</h3><p>Files are encrypted in transit and SHA-256 checked before saving. Peer identity is not authenticated, so an active LAN attacker could intercept a connection.</p><div class="security-line"><span class="security-check">✓</span><span><strong>Encrypted transport</strong><small>X25519 · AES-256-GCM · SHA-256</small></span></div></section></div>`;
 }
 function render() {
   if (!state) { root.innerHTML = '<div class="loading"><div><div class="spinner"></div>Connecting to your xdrop device…</div></div>'; return; }
-  const names = {overview:'Overview',devices:'Devices',send:'Send a file',transfers:'Transfers',settings:'Settings'};
+  const names = {overview:'Overview',devices:'Devices',send:'Send a file',transfers:'Transfers',traffic:'Traffic',insights:'Insights',settings:'Settings'};
   pageName.textContent = names[currentView] || 'Overview';
   document.querySelector('#profile-name').textContent = state.device_name;
   document.querySelector('#avatar').textContent = (state.device_name || 'x').slice(0,1).toUpperCase();
@@ -132,7 +210,7 @@ function render() {
   connection.classList.toggle('online', Boolean(state.discovery.zeroconf_active));
   document.querySelector('#connection-label').textContent = state.discovery.zeroconf_active ? 'Network active' : 'Local only';
   document.querySelectorAll('.nav-item[data-view]').forEach(button => button.classList.toggle('active', button.dataset.view === currentView));
-  root.innerHTML = ({overview,devices:devicesView,send:sendView,transfers:transfersView,settings:settingsView}[currentView] || overview)();
+  root.innerHTML = ({overview,devices:devicesView,send:sendView,transfers:transfersView,traffic:trafficView,insights:insightsView,settings:settingsView}[currentView] || overview)();
   if (currentView === 'transfers') applyHistoryFilters();
 }
 async function refresh() {
@@ -151,6 +229,20 @@ document.addEventListener('click', async event => {
   const nav = event.target.closest('[data-view]');
   if (nav) { switchView(nav.dataset.view); return; }
   const action = event.target.closest('[data-action]');
+  const qualityButton = event.target.closest('[data-quality]');
+  if (qualityButton) {
+    qualityButton.disabled = true;
+    qualityButton.textContent = 'Checking…';
+    try {
+      const result = await request('/api/quality',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({endpoint:qualityButton.dataset.quality})});
+      await refresh();
+      notify(result.last_ms == null ? `Probe failed: ${result.error || 'peer did not respond'}` : `Connect + secure probe: ${Number(result.last_ms).toFixed(1)} ms`, result.last_ms == null);
+    } catch (error) {
+      await refresh();
+      notify(error.message, true);
+    }
+    return;
+  }
   if (action?.dataset.action === 'send') { switchView('send'); return; }
   if (action?.dataset.action === 'scan-qr') { await startQrScanner(); return; }
   if (action?.dataset.action === 'close-scanner') { closeQrScanner(); return; }
