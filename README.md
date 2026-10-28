@@ -43,7 +43,7 @@ xdrop-web
 ```
 
 It opens at `http://127.0.0.1:8765` and is only available on the computer
-running xdrop. The dashboard can discover devices, send files, manage incoming
+running xdrop (start it with `xdrop-web --lan` to allow other devices on your private network). The dashboard can discover devices, send files, manage incoming
 requests, show live outgoing transfer progress with cancellation, accept drag-and-drop
 file selection, send multiple files one by one, show and scan connection QR codes,
 resume interrupted outgoing transfers, connect by IP, search and filter transfer history, clear completed history,
@@ -67,9 +67,16 @@ Received files land in `~/xdrop_files/` by default.
 
 ## How it works
 
-- **Discovery**: zeroconf broadcasts `<device-name>._xdrop._tcp.local.`
-  with your TCP port and a `name` TXT record. If mDNS is blocked by router or
-  firewall, manual Direct IP/Port mode is automatically available as a fallback.
+- **Discovery** — three methods run at the same time and their results are merged:
+  1. **mDNS / zeroconf** advertises `<device-name>._xdrop._tcp.local.` on every IPv4 interface.
+  2. **UDP broadcast beacons** on port `47475`: every 2 s each device sends a small "hello" to
+     `255.255.255.255` and to each interface's subnet broadcast (e.g. `192.168.43.255`).
+     Whoever hears it answers directly, so one working direction is enough.
+  3. **Subnet scan**: if nothing is found within ~5 s (or when you press *Scan network now* on the
+     Devices page), every address in your /24 is probed on TCP port `47474`. If the scan finds a
+     device, a transfer to it will work too.
+  Phone hotspots usually drop mDNS multicast between clients, which is why methods 2 and 3 exist.
+  You can always type the other device's IP on the Devices page (port is optional).
 - **Transport**: a fresh TCP socket per session with bounded concurrency (up to 4 concurrent transfers).
 - **Handshake**: X25519 ECDH → HKDF-SHA256 → 32-byte AES key.
 - **Peer authentication**: peers are not authenticated or pinned. Encryption protects traffic from passive network observers, but does not prevent an active machine-in-the-middle on the LAN.
@@ -80,12 +87,45 @@ Received files land in `~/xdrop_files/` by default.
   the file. Interrupted partials remain in the download folder as hidden `.xdrop_*.part` files;
   mismatched partials are removed.
 
-## Windows firewall
+## Packet analytics (web dashboard → **Packets**)
 
-The first time you run `xdrop`, Windows shows the standard
-"Allow an app to communicate" dialog. Click **Allow** on private networks.
-**No admin password is ever required.** The app prints a friendly heads-up
-before opening its socket.
+Every record xdrop puts on the network is captured live on **both** the sender and the receiver.
+No admin rights or pcap driver are needed.
+
+- **Capture table**: number, time, source → destination `ip:port`, type (`HELLO`, `OFFER`,
+  `RESPONSE`, `DATA`, `DONE`, `ACK`), frame size, TCP segments, and a description.
+- **Packet journey**: click a packet to see how it is built, layer by layer:
+  file bytes or JSON → AES-256-GCM (+16 B tag) → xdrop frame (+12 B nonce, +4 B length) →
+  TCP segments (MSS-sized) → IPv4 packets (+20 B) → Wi-Fi/Ethernet frames, with a byte bar for each layer.
+- **Real bytes on the wire**: colour-coded hex of the nonce, length field, ciphertext and GCM tag
+  (or the `PDIT` magic + public key for handshake packets). Control messages are shown decoded.
+  File contents are never shown.
+- **Kernel TCP counters** (Linux and macOS): measured MSS, RTT, segments sent and received,
+  retransmissions and congestion window for the connection. Windows does not expose these,
+  so segment counts are estimated from the MSS there.
+- **Network path**: your interface, the access point or gateway, and the peer, with its MAC
+  address from the ARP table. *Run traceroute* probes the routed path.
+- **Throughput timeline** and a **per-type table** for every transfer. The transfer analyzer
+  (click a transfer → *Packets*) links straight to the inspector.
+
+Values marked `*` are calculated from the measured MSS and standard header sizes. TCP is a
+byte stream, so the OS may split or merge records differently.
+
+## Firewall / hotspot checklist
+
+- **Windows**: when the "Allow an app to communicate" dialog appears, tick **both Private and
+  Public** (Windows often marks hotspots as *Public*), then click Allow. If you clicked Cancel
+  earlier, open *Windows Security → Firewall → Allow an app* and tick Python for both, or run in an
+  admin terminal:
+  ```
+  netsh advfirewall firewall add rule name="xdrop TCP" dir=in action=allow protocol=TCP localport=47474
+  netsh advfirewall firewall add rule name="xdrop UDP" dir=in action=allow protocol=UDP localport=47475,5353
+  ```
+- **macOS**: *System Settings → Network → Firewall → Options* → allow incoming connections for Python.
+- **Linux (ufw)**: `sudo ufw allow 47474/tcp && sudo ufw allow 47475/udp`
+- Both devices must be connected to the **same** hotspot or Wi-Fi network. Some hotspots have
+  "client isolation" (sometimes called "AP isolation"), which blocks every device-to-device
+  connection. Turn it off if your phone has the setting.
 
 ## CLI flags
 

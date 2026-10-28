@@ -67,6 +67,44 @@ def probe_peer(address: str, port: int, timeout: float = 5.0) -> float:
         sock.close()
 
 
+def identify_peer(address: str, port: int, timeout: float = 2.0) -> Optional[dict]:
+    """Ask an xdrop receiver who it is. Returns {"name", "instance_id"?} or None.
+
+    Used by the subnet scan: a successful answer proves the TCP path works.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((address, port))
+        channel = handshake(sock)
+        _send_json(channel, {"type": "probe"})
+        response = _recv_json(channel)
+        if response.get("type") != "probe_ack":
+            return None
+        return {"name": str(response.get("name") or f"xdrop @ {address}")[:64],
+                "instance_id": response.get("instance_id")}
+    except (OSError, ValueError, ConnectionError):
+        return None
+    finally:
+        sock.close()
+
+
+def _bind_listener(port: int) -> socket.socket:
+    """Create a listening TCP socket. On Windows SO_REUSEADDR lets two programs
+    share a port, so use SO_EXCLUSIVEADDRUSE there instead."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", port))
+    except OSError:
+        s.close()
+        raise
+    return s
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -216,6 +254,7 @@ class IncomingTransfer:
         self.peer_port: Optional[int] = peer_port       # sender's ephemeral TCP port
         self.local_port: Optional[int] = local_port     # our listening TCP port
         self.finished_sha256: Optional[str] = None      # SHA-256 computed by receiver
+        self.recorder = None                            # analytics.PacketRecorder (if enabled)
         # Transfer event log (application-level, not raw TCP packets)
         self._events: List[TransferEvent] = []
         self._last_progress_event: float = 0.0
@@ -358,6 +397,7 @@ def send_file(
     display_filename: Optional[str] = None,
     frame_observer: Optional[Callable[[dict], None]] = None,
     event_log: Optional[List[TransferEvent]] = None,
+    recorder=None,
 ) -> dict:
     """Send `filepath` to peer. Blocking. Returns a result dict.
 
@@ -402,11 +442,15 @@ def send_file(
         except Exception:
             pass
 
+    if recorder is not None and frame_observer is None:
+        frame_observer = recorder.record
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(10.0)
     try:
         sock.connect((peer_addr, peer_port))
         src_port = sock.getsockname()[1]
+        if recorder is not None:
+            recorder.attach_socket(sock)
         _log_event("connection", f"TCP connection established from local port {src_port} to {peer_addr}:{peer_port}")
     except Exception as e:
         sock.close()
@@ -541,6 +585,11 @@ def send_file(
         return {"ok": False, "reason": f"transfer error: {e}", "bytes_sent": sent,
                 "src_port": src_port, "dst_port": peer_port}
     finally:
+        if recorder is not None:
+            try:
+                recorder.finish()
+            except Exception:
+                pass
         try:
             sock.close()
         except Exception:
@@ -571,23 +620,23 @@ class ReceiverServer:
         self._semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_SESSIONS)
         self.on_offer: Optional[Callable[[IncomingTransfer], None]] = None
         self.on_update: Optional[Callable[[IncomingTransfer], None]] = None
+        # Returned in probe replies so the subnet scan can name this device.
+        self.identity: Optional[Callable[[], dict]] = None
+        # Analytics: factory for a PacketRecorder, and a hook called once the
+        # incoming transfer exists (so the dashboard can index it).
+        self.recorder_factory: Optional[Callable[[], object]] = None
+        self.on_recorder: Optional[Callable[[IncomingTransfer, object], None]] = None
 
     # ------------------------------------------------------------------
     def start(self) -> None:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            s.bind(("0.0.0.0", self.requested_port))
+            s = _bind_listener(self.requested_port)
         except OSError as e:
             if self.requested_port == 0:
-                s.close()
                 raise
             log.warning(f"Receiver port {self.requested_port} is busy ({e}); falling back to a random port")
-            s.close()
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("0.0.0.0", 0))
-        s.listen(8)
+            s = _bind_listener(0)
+        s.listen(16)
         self.port = s.getsockname()[1]
         self._sock = s
         log.info(f"ReceiverServer listening on port {self.port}")
@@ -697,12 +746,27 @@ class ReceiverServer:
         temp_path: Optional[Path] = None
         resumable = False
         meta_path: Optional[Path] = None
+        recorder = None
         try:
             conn.settimeout(30.0)
-            ch = handshake(conn)
+            if self.recorder_factory:
+                try:
+                    recorder = self.recorder_factory()
+                    recorder.attach_socket(conn)
+                except Exception as err:
+                    log.debug(f"Packet recorder unavailable: {err}")
+                    recorder = None
+            ch = handshake(conn, frame_observer=recorder.record if recorder else None)
             offer = _recv_json(ch)
             if offer.get("type") == "probe":
-                _send_json(ch, {"type": "probe_ack"})
+                ack = {"type": "probe_ack", "name": self._get_name()[:64]}
+                if self.identity:
+                    try:
+                        ack.update(self.identity())
+                    except Exception:
+                        pass
+                _send_json(ch, ack)
+                recorder = None  # probes are not transfers
                 return
             if offer.get("type") != "offer":
                 log.warning(f"Expected offer message from {sender_addr}, got: {offer.get('type')}")
@@ -762,6 +826,13 @@ class ReceiverServer:
                 local_port=self.port,
             )
             t.received = resume_offset
+            if recorder is not None:
+                t.recorder = recorder
+                if self.on_recorder:
+                    try:
+                        self.on_recorder(t, recorder)
+                    except Exception as err:
+                        log.debug(f"on_recorder hook failed: {err}")
             t.add_event("connection", f"TCP connection accepted from {sender_addr} (peer port {_peer_port}); local port {self.port}")
             t.add_event("handshake", "X25519 key exchange and HKDF-SHA256 complete; AES-256-GCM channel established")
             t.add_event("offer", f"Offer received: '{filename}' {human_size(size)} SHA-256 {offered_digest[:12] if offered_digest else '(none)'}…{' [resumable]' if resumable else ''}")
@@ -942,6 +1013,11 @@ class ReceiverServer:
                 try:
                     meta_path.unlink(missing_ok=True)
                 except OSError:
+                    pass
+            if recorder is not None:
+                try:
+                    recorder.finish()
+                except Exception:
                     pass
             try:
                 conn.close()

@@ -15,17 +15,18 @@ import webbrowser
 from collections import Counter, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
 from .config import Config
 from .crypto import GCM_TAG_LEN, HANDSHAKE_LEN, LEN_LEN, NONCE_LEN
-from .discovery import DiscoveryService, _primary_ipv4, parse_peer_endpoint
+from .analytics import PacketHub, PacketRecorder, network_path
+from .discovery import BEACON_PORT, DiscoveryService, _primary_ipv4, parse_peer_endpoint
 from .logger import init_logging
 from .transfer import (
-    CHUNK_SIZE, IncomingTransfer, ReceiverServer, TransferEvent,
-    probe_peer, sanitize_filename, send_file,
+    CHUNK_SIZE, DEFAULT_RECEIVER_PORT, IncomingTransfer, ReceiverServer, TransferEvent,
+    identify_peer, probe_peer, sanitize_filename, send_file,
 )
 
 try:
@@ -40,74 +41,8 @@ MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 MAX_TRACE_HOPS = 8
 
 
-class ProtocolRecorder:
-    """Aggregate observed xdrop records without retaining file payloads."""
-
-    def __init__(self) -> None:
-        self.started_at = time.time()
-        self.lock = threading.Lock()
-        self.sequence = 0
-        self.total = Counter()
-        self.by_type: dict[tuple[str, str], Counter] = {}
-        self.chunk_sizes: Counter = Counter()
-        self.recent = deque(maxlen=120)
-
-    def record(self, event: dict) -> None:
-        direction = str(event.get("direction", "unknown"))
-        record_type = str(event.get("record_type", "record"))
-        plaintext = max(0, int(event.get("plaintext_bytes", 0)))
-        ciphertext = max(0, int(event.get("ciphertext_bytes", 0)))
-        frame_bytes = max(0, int(event.get("frame_bytes", 0)))
-        overhead = max(0, int(event.get("overhead_bytes", 0)))
-        with self.lock:
-            self.sequence += 1
-            item = {
-                "sequence": self.sequence,
-                "time_ms": round(max(0, float(event.get("timestamp", time.time())) - self.started_at) * 1000, 2),
-                "direction": direction,
-                "record_type": record_type,
-                "plaintext_bytes": plaintext,
-                "ciphertext_bytes": ciphertext,
-                "frame_bytes": frame_bytes,
-                "overhead_bytes": overhead,
-                "encrypted": bool(event.get("encrypted")),
-            }
-            self.recent.append(item)
-            self.total.update({
-                "records": 1,
-                "plaintext_bytes": plaintext,
-                "ciphertext_bytes": ciphertext,
-                "frame_bytes": frame_bytes,
-                "overhead_bytes": overhead,
-                "encrypted_records": int(item["encrypted"]),
-                "encrypted_frame_bytes": frame_bytes if item["encrypted"] else 0,
-            })
-            counter = self.by_type.setdefault((direction, record_type), Counter())
-            counter.update({
-                "records": 1,
-                "plaintext_bytes": plaintext,
-                "ciphertext_bytes": ciphertext,
-                "frame_bytes": frame_bytes,
-                "overhead_bytes": overhead,
-            })
-            if record_type == "file_chunk":
-                self.chunk_sizes[plaintext] += 1
-
-    def snapshot(self) -> dict:
-        with self.lock:
-            return {
-                "totals": dict(self.total),
-                "by_type": [
-                    {"direction": direction, "record_type": record_type, **dict(values)}
-                    for (direction, record_type), values in sorted(self.by_type.items())
-                ],
-                "chunk_sizes": [
-                    {"plaintext_bytes": amount, "records": count}
-                    for amount, count in sorted(self.chunk_sizes.items())
-                ],
-                "recent_records": list(self.recent),
-                "sample_limit": self.recent.maxlen,
-            }
+# Kept for backwards compatibility with older imports.
+ProtocolRecorder = PacketRecorder
 
 
 def _trace_route(target: str) -> dict:
@@ -286,14 +221,20 @@ class Dashboard:
             self.config.device_name = self.config.device_name
             self.config.save()
         self.config.ensure_download_dir()
+        self.packets = PacketHub()
         self.receiver = ReceiverServer(
             get_download_dir=self.config.ensure_download_dir,
             get_device_name=lambda: self.config.device_name,
             port=self.config.port,
         )
+        self.receiver.identity = lambda: {"instance_id": self.discovery.instance_id}
+        self.receiver.recorder_factory = lambda: PacketRecorder(role="receiver")
+        self.receiver.on_recorder = lambda t, rec: self.packets.register(
+            t.id, rec, label=f"↓ {t.filename} from {t.sender_name}")
         self.receiver.start()
-        self.discovery = DiscoveryService(self.config.device_name, self.receiver.port)
+        self.discovery = DiscoveryService(self.config.device_name, self.receiver.port, identify=identify_peer)
         self.discovery.start()
+        self._path_cache: Dict[str, tuple] = {}
         self.outgoing: list[dict] = []
         self.cancel_events: Dict[str, threading.Event] = {}
         self.quality: Dict[str, dict] = {}
@@ -318,17 +259,19 @@ class Dashboard:
             "download_dir": str(self.config.download_dir),
             "local_ip": diagnostics.get("local_ip") or _primary_ipv4(),
             "port": self.receiver.port,
+            "default_port": DEFAULT_RECEIVER_PORT,
+            "beacon_port": BEACON_PORT,
             "started_at": self.started_at,
             "qr_available": HAS_QR,
             "discovery": diagnostics,
             "peers": [
                 {"name": peer.name, "address": peer.address, "port": peer.port, "last_seen": peer.last_seen,
-                 "quality": self.quality.get(f"{peer.address}:{peer.port}")}
+                 "via": peer.via, "quality": self.quality.get(f"{peer.address}:{peer.port}")}
                 for peer in self.discovery.peers()
             ],
             "discovered_peers": [
                 {"name": peer.name, "address": peer.address, "port": peer.port,
-                 "last_seen": peer.last_seen, "online": peer.online,
+                 "last_seen": peer.last_seen, "online": peer.online, "via": peer.via,
                  "quality": self.quality.get(f"{peer.address}:{peer.port}")}
                 for peer in self.discovery.discovered_peers()
             ],
@@ -393,8 +336,10 @@ class Dashboard:
         event_list: list = []
         with self.lock:
             self.cancel_events[item["id"]] = cancel_event
-            telemetry = self.protocol_telemetry.setdefault(item["id"], ProtocolRecorder())
+            telemetry = PacketRecorder(role="sender")
+            self.protocol_telemetry[item["id"]] = telemetry
             self.outgoing_events[item["id"]] = event_list
+        self.packets.register(item["id"], telemetry, label=f"↑ {item['filename']} to {item['peer']}")
         def worker() -> None:
             progress_started = None
             progress_last_at = None
@@ -419,7 +364,7 @@ class Dashboard:
                     item["peer"], item["port"], Path(item["_source_path"]),
                     self.config.device_name, progress=progress,
                     cancel_event=cancel_event, display_filename=item["filename"],
-                    frame_observer=telemetry.record,
+                    recorder=telemetry,
                     event_log=event_list,
                 )
                 with self.lock:
@@ -480,6 +425,7 @@ class Dashboard:
                         pass
                     self.protocol_telemetry.pop(item["id"], None)
                     self.outgoing_events.pop(item["id"], None)
+                    self.packets.forget(item["id"])
             self.outgoing = [item for item in self.outgoing if item.get("status") not in terminal]
             for transfer_id in list(self.cancel_events):
                 if not any(item["id"] == transfer_id for item in self.outgoing):
@@ -494,6 +440,16 @@ class Dashboard:
             subprocess.Popen(["open", str(folder)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             subprocess.Popen(["xdg-open", str(folder)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def path_to(self, remote_ip: str) -> dict:
+        """Hop-by-hop path to a peer (cached briefly; runs route/arp commands)."""
+        cached = self._path_cache.get(remote_ip)
+        if cached and time.time() - cached[0] < 20:
+            return cached[1]
+        local_ip = self.discovery.local_ip or _primary_ipv4()
+        result = network_path(local_ip, remote_ip, self.discovery.interfaces)
+        self._path_cache[remote_ip] = (time.time(), result)
+        return result
 
     def get_analyzer_data(self, transfer_id: str, event_offset: int = 0, event_limit: int = 100) -> dict:
         """Build the full analyzer payload for a given transfer ID.
@@ -558,6 +514,7 @@ class Dashboard:
                     "remote_port": t.peer_port,
                     "same_subnet": _same_subnet(local_ip, sender_ip),
                 },
+                "telemetry": t.recorder.snapshot() if t.recorder else None,
             }
 
         # --- Try outgoing ---
@@ -731,9 +688,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             if parsed.path == "/api/validate-peer":
                 endpoint = str(self._read_json().get("endpoint", "")).strip()
-                if not re.fullmatch(r"[^:]+:\d+", endpoint):
-                    raise ValueError("Enter an IP address or hostname followed by a port, such as 192.168.1.24:50000")
-                peer = parse_peer_endpoint(endpoint, dashboard.receiver.port)
+                if not re.fullmatch(r"[^:\s]+(:\d+)?", endpoint):
+                    raise ValueError(f"Enter an IP address such as 192.168.1.24 (port {DEFAULT_RECEIVER_PORT} is used if you leave it out)")
+                peer = parse_peer_endpoint(endpoint, DEFAULT_RECEIVER_PORT)
                 if not peer:
                     raise ValueError("That address or port is not valid. Check both and try again.")
                 self._json(200, {"ok": True, "address": peer.address, "port": peer.port, "label": f"{peer.address}:{peer.port}"})
@@ -741,7 +698,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             if parsed.path == "/api/quality":
                 endpoint = str(self._read_json().get("endpoint", "")).strip()
-                peer = parse_peer_endpoint(endpoint, dashboard.receiver.port)
+                peer = parse_peer_endpoint(endpoint, DEFAULT_RECEIVER_PORT)
                 if not peer:
                     raise ValueError("Enter a valid peer address and port")
                 self._json(200, dashboard.check_peer_quality(peer.address, peer.port))
@@ -751,7 +708,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 body = self._read_json()
                 endpoint = str(body.get("endpoint", "")).strip()
                 transfer_id = str(body.get("transfer_id", "")).strip()
-                peer = parse_peer_endpoint(endpoint, dashboard.receiver.port)
+                peer = parse_peer_endpoint(endpoint, DEFAULT_RECEIVER_PORT)
                 if not peer:
                     raise ValueError("Enter a valid peer address and port")
                 # Accept both incoming and outgoing transfers; check endpoint matches
@@ -816,6 +773,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._json(200, trace)
                 return
 
+            if parsed.path == "/api/scan":
+                started = dashboard.discovery.scan_async()
+                self._json(202 if started else 409, {"ok": started, "scan": dashboard.discovery.scan_state})
+                return
+
             if parsed.path == "/api/history/clear":
                 removed = dashboard.clear_finished_history()
                 self._json(200, {"ok": True, "removed": removed})
@@ -855,7 +817,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/network-diag":
                 body = self._read_json()
                 endpoint = str(body.get("endpoint", "")).strip()
-                peer = parse_peer_endpoint(endpoint, dashboard.receiver.port)
+                peer = parse_peer_endpoint(endpoint, DEFAULT_RECEIVER_PORT)
                 if not peer:
                     raise ValueError("Enter a valid peer address and port")
                 local_ip = dashboard.discovery.local_ip or _primary_ipv4()
@@ -907,14 +869,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         raise ValueError("Select at least one discovered device for multicast")
                     recipients = []
                     for endpoint in dict.fromkeys(selected_endpoints):
-                        peer = parse_peer_endpoint(endpoint, self.server.dashboard.receiver.port)
+                        peer = parse_peer_endpoint(endpoint, DEFAULT_RECEIVER_PORT)
                         if not peer or peer.endpoint not in available:
                             raise ValueError("A selected device is no longer available. Refresh and try again")
                         recipients.append(available[peer.endpoint])
                 else:
                     if len(selected_endpoints) != 1:
                         raise ValueError("Unicast needs exactly one device")
-                    peer = parse_peer_endpoint(selected_endpoints[0], self.server.dashboard.receiver.port)
+                    peer = parse_peer_endpoint(selected_endpoints[0], DEFAULT_RECEIVER_PORT)
                     if not peer:
                         raise ValueError("Enter a valid IP address or hostname and port")
                     recipients = [peer]
@@ -1007,6 +969,38 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(200, dashboard.state())
             return
 
+        if path == "/api/packets":
+            try:
+                since = int(qs.get("since", ["0"])[0])
+            except ValueError:
+                since = 0
+            self._json(200, dashboard.packets.snapshot(since))
+            return
+
+        if path.startswith("/api/packets/"):
+            transfer_id = path[len("/api/packets/"):].strip("/")
+            recorder = dashboard.packets.get(transfer_id)
+            if not recorder:
+                self._json(404, {"error": "No packet data for this transfer"})
+                return
+            try:
+                offset = max(0, int(qs.get("offset", ["0"])[0]))
+                limit = max(1, min(1000, int(qs.get("limit", ["500"])[0])))
+            except ValueError:
+                offset, limit = 0, 500
+            self._json(200, recorder.records(offset, limit, qs.get("type", [""])[0], qs.get("direction", [""])[0]))
+            return
+
+        if path == "/api/path":
+            remote = qs.get("ip", [""])[0].strip()
+            try:
+                ipaddress.IPv4Address(remote)
+            except ValueError:
+                self._json(400, {"error": "Enter a valid IPv4 address"})
+                return
+            self._json(200, dashboard.path_to(remote))
+            return
+
         # Transfer analyzer endpoint: GET /api/analyzer/<transfer_id>
         analyzer_prefix = "/api/analyzer/"
         if path.startswith(analyzer_prefix):
@@ -1040,6 +1034,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._json(404, {"error": "Not found"})
 
 
+def _print_network_help(dashboard: "Dashboard") -> None:
+    port = dashboard.receiver.port
+    addresses = ", ".join(f"{i['ip']}:{port} ({i['name']})" for i in dashboard.discovery.interfaces) or "none detected"
+    print(f"This device can be reached at: {addresses}")
+    print(f"Discovery: mDNS + UDP broadcast on port {BEACON_PORT} + automatic subnet scan on TCP port {port}.")
+    if os.name == "nt":
+        print("Windows firewall: when asked, tick BOTH 'Private' and 'Public' and click Allow.\n"
+              "  Hotspots are often marked 'Public'. Or run once in an admin terminal:\n"
+              f"  netsh advfirewall firewall add rule name=\"xdrop TCP\" dir=in action=allow protocol=TCP localport={port}\n"
+              f"  netsh advfirewall firewall add rule name=\"xdrop UDP\" dir=in action=allow protocol=UDP localport={BEACON_PORT},5353")
+    elif sys.platform == "darwin":
+        print("macOS firewall: allow incoming connections for Python (System Settings → Network → Firewall → Options).")
+    else:
+        print(f"Linux firewall (if enabled): sudo ufw allow {port}/tcp && sudo ufw allow {BEACON_PORT}/udp")
+
+
 def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(prog="xdrop-web")
@@ -1052,10 +1062,7 @@ def main() -> None:
         server = DashboardServer((bind_ip, 8765), dashboard)
         url = "http://127.0.0.1:8765"
         print(f"xdrop dashboard is running at {url}{' (LAN access enabled)' if args.lan else ' (local computer only)'}")
-        if os.name == "nt":
-            print("Firewall help: allow Python on Private networks and set this Wi-Fi network to Private.")
-        elif sys.platform == "darwin":
-            print("Firewall help: allow incoming connections for Python under System Settings → Network → Firewall.")
+        _print_network_help(dashboard)
         webbrowser.open(url)
         server.serve_forever()
     except KeyboardInterrupt:

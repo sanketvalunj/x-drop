@@ -54,11 +54,12 @@ class SecureChannel:
     frame_observer: Optional[Callable[[dict], None]] = None
 
     def _record(self, direction: str, record_type: str, plaintext_bytes: int,
-                ciphertext_bytes: int, frame_bytes: int, encrypted: bool) -> None:
+                ciphertext_bytes: int, frame_bytes: int, encrypted: bool,
+                header: bytes = b"", ciphertext: bytes = b"", plaintext: bytes = b"") -> None:
         if not self.frame_observer:
             return
         try:
-            self.frame_observer({
+            event = {
                 "timestamp": time.time(),
                 "direction": direction,
                 "record_type": record_type,
@@ -67,7 +68,15 @@ class SecureChannel:
                 "frame_bytes": frame_bytes,
                 "overhead_bytes": max(0, frame_bytes - plaintext_bytes),
                 "encrypted": encrypted,
-            })
+                # Real bytes as they appear on the wire (never file plaintext):
+                "header_hex": header.hex() if header else None,          # nonce (12) + length (4)
+                "cipher_preview_hex": ciphertext[:24].hex() if ciphertext else None,
+                "tag_hex": ciphertext[-GCM_TAG_LEN:].hex() if len(ciphertext) >= GCM_TAG_LEN else None,
+            }
+            if record_type != "file_chunk" and plaintext and len(plaintext) <= 4096:
+                # Control messages are our own JSON metadata; show them decoded.
+                event["control"] = plaintext.decode("utf-8", errors="replace")[:600]
+            self.frame_observer(event)
         except Exception:
             pass
 
@@ -78,7 +87,8 @@ class SecureChannel:
         header = nonce + struct.pack(">I", len(ct))
         frame = header + ct
         self.sock.sendall(frame)
-        self._record("sent", record_type, len(plaintext), len(ct), len(frame), True)
+        self._record("sent", record_type, len(plaintext), len(ct), len(frame), True,
+                     header=header, ciphertext=ct, plaintext=plaintext if record_type != "file_chunk" else b"")
 
     def recv(self, record_type: str = "data") -> bytes:
         header = _recv_exact(self.sock, NONCE_LEN + LEN_LEN)
@@ -97,7 +107,8 @@ class SecureChannel:
                     record_type = message["type"]
             except (UnicodeDecodeError, json.JSONDecodeError):
                 pass
-        self._record("received", record_type, len(plaintext), len(ct), NONCE_LEN + LEN_LEN + len(ct), True)
+        self._record("received", record_type, len(plaintext), len(ct), NONCE_LEN + LEN_LEN + len(ct), True,
+                     header=header, ciphertext=ct, plaintext=plaintext if record_type != "file_chunk" else b"")
         return plaintext
 
 
@@ -127,14 +138,14 @@ def handshake(sock: socket.socket, frame_observer: Optional[Callable[[dict], Non
     sock.sendall(hello)
     if frame_observer:
         try:
-            frame_observer({"timestamp": time.time(), "direction": "sent", "record_type": "handshake_hello", "plaintext_bytes": len(hello), "ciphertext_bytes": 0, "frame_bytes": len(hello), "overhead_bytes": 0, "encrypted": False})
+            frame_observer({"timestamp": time.time(), "direction": "sent", "record_type": "handshake_hello", "plaintext_bytes": len(hello), "ciphertext_bytes": 0, "frame_bytes": len(hello), "overhead_bytes": 0, "encrypted": False, "raw_hex": hello.hex()})
         except Exception:
             pass
     # read peer hello
     hello = _recv_exact(sock, HANDSHAKE_LEN)
     if frame_observer:
         try:
-            frame_observer({"timestamp": time.time(), "direction": "received", "record_type": "handshake_hello", "plaintext_bytes": len(hello), "ciphertext_bytes": 0, "frame_bytes": len(hello), "overhead_bytes": 0, "encrypted": False})
+            frame_observer({"timestamp": time.time(), "direction": "received", "record_type": "handshake_hello", "plaintext_bytes": len(hello), "ciphertext_bytes": 0, "frame_bytes": len(hello), "overhead_bytes": 0, "encrypted": False, "raw_hex": hello.hex()})
         except Exception:
             pass
     if hello[: len(MAGIC)] != MAGIC:

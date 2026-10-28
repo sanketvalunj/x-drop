@@ -32,6 +32,7 @@ from .discovery import DiscoveryService, Peer, _primary_ipv4, parse_peer_endpoin
 from .logger import LOG_FILE, get_logger, get_recent_logs, init_logging
 from .transfer import (
     DEFAULT_RECEIVER_PORT,
+    identify_peer,
     MAX_CONCURRENT_SESSIONS,
     STATUS_ACTIVE,
     STATUS_CANCELLED,
@@ -146,9 +147,10 @@ def _onboard(cfg: Config) -> None:
 def _firewall_warning() -> None:
     if os.name == "nt":
         console.print(
-            "[yellow]Firewall help:[/yellow] Allow Python on [bold]Private networks[/bold] "
-            "and set this Wi-Fi network to [bold]Private[/bold]. "
-            f"Optional admin command: [dim]netsh advfirewall firewall add rule name=\"xdrop TCP\" dir=in action=allow protocol=TCP localport={DEFAULT_RECEIVER_PORT}[/dim]"
+            "[yellow]Firewall help:[/yellow] when Windows asks, tick [bold]Private AND Public[/bold] and click Allow "
+            "(phone hotspots are often marked Public). "
+            f"Optional admin commands: [dim]netsh advfirewall firewall add rule name=\"xdrop TCP\" dir=in action=allow protocol=TCP localport={DEFAULT_RECEIVER_PORT}[/dim] "
+            "[dim]and[/dim] [dim]netsh advfirewall firewall add rule name=\"xdrop UDP\" dir=in action=allow protocol=UDP localport=47475,5353[/dim]"
         )
     elif sys.platform == "darwin":
         console.print("[dim]Firewall help: allow incoming connections for Python under System Settings → Network → Firewall.[/dim]")
@@ -774,7 +776,8 @@ def main() -> None:
     _firewall_warning()
     rx.start()
 
-    disc = DiscoveryService(cfg.device_name, rx.port)
+    disc = DiscoveryService(cfg.device_name, rx.port, identify=identify_peer)
+    rx.identity = lambda: {"instance_id": disc.instance_id}
     disc.start()
     ip = disc.local_ip or _primary_ipv4()
     console.print(f"[bold cyan]This device address: {ip or 'IP unavailable'}:{rx.port}[/bold cyan]")

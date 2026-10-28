@@ -120,8 +120,11 @@ def test_receiver_uses_default_port_and_falls_back_when_busy():
     from xdrop.transfer import DEFAULT_RECEIVER_PORT
     occupied = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     occupied.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    occupied.bind(("0.0.0.0", DEFAULT_RECEIVER_PORT))
-    occupied.listen(1)
+    try:
+        occupied.bind(("0.0.0.0", DEFAULT_RECEIVER_PORT))
+        occupied.listen(1)
+    except OSError:
+        pass  # already held by another receiver, which is the condition we want
     try:
         rx = ReceiverServer(get_download_dir=lambda: Path(tempfile.mkdtemp()), get_device_name=lambda: "receiver")
         rx.start()
@@ -133,10 +136,22 @@ def test_receiver_uses_default_port_and_falls_back_when_busy():
     finally:
         occupied.close()
 
+    # Another test (or a running xdrop) may still hold the default port; only
+    # assert the default is used when it is actually free.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("0.0.0.0", DEFAULT_RECEIVER_PORT))
+        port_free = True
+    except OSError:
+        port_free = False
+    finally:
+        probe.close()
     rx = ReceiverServer(get_download_dir=lambda: Path(tempfile.mkdtemp()), get_device_name=lambda: "receiver")
     rx.start()
     try:
-        assert rx.port == DEFAULT_RECEIVER_PORT
+        if port_free:
+            assert rx.port == DEFAULT_RECEIVER_PORT
+        assert rx.port > 0
     finally:
         rx.stop()
 

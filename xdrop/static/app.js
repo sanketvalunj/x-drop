@@ -211,8 +211,8 @@ function renderAnalyzerModal() {
   const d = analyzerData;
   const ov = d.overview || {};
   const dirLabel = d.direction === 'incoming' ? '↓ Incoming' : '↑ Outgoing';
-  const tabs = ['overview','events','protocol','route','diagnostics'];
-  const tabLabels = {overview:'Overview',events:'Events',protocol:'Protocol Stack',route:'Route',diagnostics:'Diagnostics'};
+  const tabs = ['overview','packets','events','protocol','route','diagnostics'];
+  const tabLabels = {overview:'Overview',packets:'Packets',events:'Events',protocol:'Protocol Stack',route:'Route',diagnostics:'Diagnostics'};
   const tabsHTML = tabs.map(tab => `<button class="az-tab${analyzerTab===tab?' active':''}" data-az-tab="${tab}">${tabLabels[tab]}</button>`).join('');
 
   // --- OVERVIEW ---
@@ -344,7 +344,19 @@ function renderAnalyzerModal() {
     </div>`;
 
   // Build section content
-  const sections = {overview:overviewHTML, events:eventsHTML, protocol:stackHTML, route:routeHTML, diagnostics:diagHTML};
+  const tel = d.telemetry;
+  const pkTotals = tel?.totals || {};
+  const packetsHTML = tel ? `
+    <div class="az-stat-row">
+      <div class="az-stat"><span>Packets (records)</span><strong>${fmtNum(pkTotals.records)}</strong><small>${fmtNum(pkTotals.sent_records)} sent · ${fmtNum(pkTotals.received_records)} received</small></div>
+      <div class="az-stat"><span>Encryption + framing</span><strong>${fmtNum(pkTotals.overhead_bytes)} B</strong><small>${pct(pkTotals.overhead_bytes, pkTotals.frame_bytes)} of ${size(pkTotals.frame_bytes || 0)}</small></div>
+      <div class="az-stat"><span>TCP segments</span><strong>${tel.tcp?.delta_segs_out != null ? fmtNum((tel.tcp.delta_segs_out || 0) + (tel.tcp.delta_segs_in || 0)) : fmtNum(pkTotals.tcp_segments_est)}</strong><small>${tel.tcp?.delta_segs_out != null ? 'measured by kernel' : `estimated · MSS ${fmtNum(tel.mss)} B`}</small></div>
+    </div>
+    ${typeTable(tel)}
+    <div class="pk-card"><h3>Throughput timeline</h3>${timelineChart(tel.timeline)}</div>
+    <button class="az-route-btn" data-open-packets="${escapeHTML(analyzerTransferId)}">▥ Open the packet inspector for this transfer</button>`
+    : `<div class="az-empty">No packet data was recorded for this transfer.</div>`;
+  const sections = {overview:overviewHTML, packets:packetsHTML, events:eventsHTML, protocol:stackHTML, route:routeHTML, diagnostics:diagHTML};
   panel.innerHTML = `
     <div class="az-header">
       <div class="az-header-left">
@@ -439,17 +451,41 @@ function overview() {
     ${pending.length ? `<section class="section-block"><div class="section-head"><h2>Incoming requests <span class="nav-count">${pending.length}</span></h2><button class="text-link" data-view="transfers">View all</button></div>${pending.map(incomingCard).join('')}</section>` : ''}
     <div class="columns"><section><div class="section-head"><h2>Devices nearby</h2><button class="text-link" data-view="devices">See all</button></div><div class="card device-list">${peers.length ? peers.slice(0,4).map(peer => deviceRow(peer,true)).join('') : `<div class="empty"><div class="empty-mark">◉</div><strong>No devices found yet</strong>Make sure your other device is on the same Wi-Fi network.</div>`}</div></section><section><div class="section-head"><h2>Recent activity</h2><button class="text-link" data-view="transfers">History</button></div><div class="card activity-list">${activityHTML}</div></section></div>`;
 }
+const VIA_LABEL = {mdns:'mDNS', broadcast:'Broadcast', scan:'Scan', direct:'Direct'};
+function viaBadges(via = '') {
+  return String(via || '').split('+').filter(Boolean).map(v => `<span class="via-badge via-${escapeHTML(v)}">${escapeHTML(VIA_LABEL[v] || v)}</span>`).join('');
+}
+function discoveryCard() {
+  const d = state.discovery || {};
+  const methods = d.methods || {};
+  const beacon = d.beacon_stats || {};
+  const scan = d.scan || {};
+  const ifaces = d.interfaces || [];
+  const scanLabel = scan.running ? 'Scanning…' : scan.last_finished ? `Last scan ${timeLabel(scan.last_finished)} · ${scan.found || 0} found in ${scan.hosts || 0} probes` : 'Runs automatically if nothing is found';
+  const method = (key, title, active, detail) => `<div class="disc-method ${active ? 'on' : 'off'}"><div class="disc-method-head"><i></i><strong>${title}</strong><span>${methods[key] || 0} found</span></div><small>${detail}</small></div>`;
+  return `<section class="card disc-card"><div class="section-head"><div><h2>How devices are found</h2><span class="traffic-caption">Three methods run together. Phone hotspots often block mDNS, so broadcast and scan keep working.</span></div><button class="button button-secondary button-small" data-action="scan-network" ${scan.running ? 'disabled' : ''}>${scan.running ? 'Scanning…' : '⌕ Scan network now'}</button></div>
+    <div class="disc-methods">
+      ${method('mdns','mDNS / Bonjour', d.zeroconf_active, d.zeroconf_active ? (d.registered ? 'Advertising _xdrop._tcp on every interface' : 'Browsing only, registration failed') : escapeHTML(d.last_error || 'Unavailable'))}
+      ${method('broadcast','UDP broadcast', d.beacon_active, d.beacon_active ? `Port ${d.beacon_port} · ${beacon.sent || 0} hellos sent · ${beacon.received || 0} heard${d.beacon_bound ? '' : ' · port busy, replies only'}` : 'Unavailable on this network')}
+      ${method('scan','Subnet scan', true, escapeHTML(scanLabel))}
+    </div>
+    <div class="disc-ifaces">${ifaces.length ? ifaces.map(i => `<span><b>${escapeHTML(i.ip)}</b>/${i.prefix} · ${escapeHTML(i.name)}</span>`).join('') : '<span>No network interface detected. Connect to Wi-Fi or a hotspot.</span>'}</div>
+    ${!(state.peers || []).length ? `<div class="disc-help"><strong>Still nothing?</strong> Both devices must be on the same hotspot. On Windows, allow Python on <b>Public</b> networks too (hotspots are usually Public). Or type the other device’s IP in “Connect by IP”: it is shown on that device’s Send page.</div>` : ''}
+  </section>`;
+}
 function devicesView() {
   const peers = state.peers || [];
   return `${heading('NETWORK','Devices','Choose a nearby device or connect directly with an IP address.')}
-    <section class="connect-card"><div class="connect-copy"><div class="eyebrow">DIRECT CONNECTION</div><h2>Connect by IP</h2><p>Enter the address and transfer port shown in xdrop on the other device.</p></div><form id="connect-form"><label class="sr-only" for="connect-address">Device IP address and port</label><div class="connect-controls"><input id="connect-address" placeholder="192.168.1.24:50000" autocomplete="off" required><button class="button button-primary" type="submit">Continue <span>→</span></button></div><span class="connect-error" id="connect-error" aria-live="polite"></span><span class="field-hint">Example: 192.168.1.24:50000 · Use an IPv4 address or device hostname.</span></form></section>
-    <div class="section-head device-section-head"><h2>Nearby devices</h2><span class="field-hint">${peers.length} available</span></div>${peers.length ? `<div class="device-grid">${peers.map(peer => `<article class="device-card"><div class="device-card-head"><div class="device-avatar">${escapeHTML((peer.name || '?').slice(0,1).toUpperCase())}</div><div><strong>${escapeHTML(peer.name)}</strong><span>Available now</span></div></div><div class="device-address">${escapeHTML(peer.address)}:${peer.port}</div><button class="button button-secondary" data-send-peer="${escapeHTML(peer.address)}:${peer.port}">Send a file <span>↗</span></button></article>`).join('')}</div>` : `<div class="card empty"><div class="empty-mark">◉</div><strong>No nearby devices</strong>Keep xdrop open on another device connected to the same local network. Or use the Connect by IP form above.</div>`}`;
+    <div class="copy-address-row"><div><span>This device · other devices can type this</span><strong>${escapeHTML(state.local_ip ? `${state.local_ip}:${state.port}` : 'Address not detected')}</strong></div><button class="button button-quiet button-small" data-copy-address="${escapeHTML(state.local_ip ? `${state.local_ip}:${state.port}` : '')}" ${state.local_ip ? '' : 'disabled'}>Copy</button></div>
+    ${discoveryCard()}
+    <section class="connect-card"><div class="connect-copy"><div class="eyebrow">DIRECT CONNECTION</div><h2>Connect by IP</h2><p>Enter the address shown in xdrop on the other device.</p></div><form id="connect-form"><label class="sr-only" for="connect-address">Device IP address and port</label><div class="connect-controls"><input id="connect-address" placeholder="192.168.43.24" autocomplete="off" required><button class="button button-primary" type="submit">Continue <span>→</span></button></div><span class="connect-error" id="connect-error" aria-live="polite"></span><span class="field-hint">Example: 192.168.43.24 or 192.168.43.24:47474 · the port is optional.</span></form></section>
+    <div class="section-head device-section-head"><h2>Nearby devices</h2><span class="field-hint">${peers.length} available</span></div>${peers.length ? `<div class="device-grid">${peers.map(peer => `<article class="device-card"><div class="device-card-head"><div class="device-avatar">${escapeHTML((peer.name || '?').slice(0,1).toUpperCase())}</div><div><strong>${escapeHTML(peer.name)}</strong><div class="via-row">${viaBadges(peer.via)}</div></div></div><div class="device-address">${escapeHTML(peer.address)}:${peer.port}</div><button class="button button-secondary" data-send-peer="${escapeHTML(peer.address)}:${peer.port}">Send a file <span>↗</span></button></article>`).join('')}</div>` : `<div class="card empty"><div class="empty-mark">◉</div><strong>No nearby devices yet</strong>Keep xdrop open on the other device. Discovery keeps trying every few seconds.</div>`}`;
 }
 function sendView(selectedPeer = '') {
   const options = (state.peers || []).map(peer => `<option value="${escapeHTML(peer.address)}:${peer.port}" ${selectedPeer === `${peer.address}:${peer.port}` ? 'selected' : ''}>${escapeHTML(peer.name)} · ${escapeHTML(peer.address)}:${peer.port}</option>`).join('');
   const peerChoices = (state.peers || []).map((peer,index) => `<label class="multicast-peer"><input type="checkbox" name="multicast-peer" value="${escapeHTML(peer.address)}:${peer.port}"><span><strong>${escapeHTML(peer.name)}</strong><small>${escapeHTML(peer.address)}:${peer.port}</small></span></label>`).join('');
   return `${heading('NEW TRANSFER','Send files','Choose one or more files. Each arrives as its own encrypted transfer.')}
-    <div class="copy-address-row"><div><span>This device · share this address</span><strong>${escapeHTML(state.local_ip ? `${state.local_ip}:${state.port}` : 'Address not detected')}</strong></div><button class="button button-quiet button-small" data-copy-address="${escapeHTML(state.local_ip ? `${state.local_ip}:${state.port}` : '')}" ${state.local_ip ? '' : 'disabled'}>Copy</button></div>${!peers.length && Date.now()/1000 - state.started_at >= 10 ? '<div class="empty"><strong>No devices found after 10 seconds</strong>Wi-Fi may block mDNS or isolate clients, common on college networks. Try a phone hotspot or connect by IP.</div>' : ''}
+    <div class="copy-address-row"><div><span>This device · share this address</span><strong>${escapeHTML(state.local_ip ? `${state.local_ip}:${state.port}` : 'Address not detected')}</strong></div><button class="button button-quiet button-small" data-copy-address="${escapeHTML(state.local_ip ? `${state.local_ip}:${state.port}` : '')}" ${state.local_ip ? '' : 'disabled'}>Copy</button></div>${!(state.peers || []).length && Date.now()/1000 - state.started_at >= 10 ? '<div class="empty"><strong>No devices found after 10 seconds</strong>Wi-Fi may block mDNS or isolate clients, common on college networks. Try a phone hotspot or connect by IP.</div>' : ''}
     <div class="card send-card"><form id="send-form"><div class="field"><label for="delivery-mode">DELIVERY MODE</label><select id="delivery-mode" class="select-input"><option value="unicast" selected>Unicast · one device</option><option value="multicast">Multicast · selected devices</option><option value="broadcast">Broadcast · all nearby devices</option></select><span class="field-hint">Group delivery uses a separate encrypted connection to each device.</span></div><div id="unicast-target"><div class="field"><label for="peer-target">SEND TO DEVICE</label><select id="peer-target" class="select-input"><option value="">${options ? 'Choose a nearby device' : 'No devices found · enter an address below'}</option>${options}</select></div><div class="manual-label">OR CONNECT DIRECTLY</div><div class="field"><label for="manual-peer">DEVICE ADDRESS</label><input id="manual-peer" placeholder="192.168.1.24" value="${escapeHTML(selectedPeer)}"><span class="field-hint">Enter the other device’s IP; the default receiver port is used automatically.</span></div></div><div class="field multicast-target" id="multicast-target" hidden><label>SELECT DEVICES</label><div class="multicast-list">${peerChoices || '<div class="multicast-empty">No nearby xdrop devices found yet.</div>'}</div></div><div class="broadcast-target" id="broadcast-target" hidden><strong>${(state.peers || []).length} nearby ${(state.peers || []).length === 1 ? 'device' : 'devices'} will receive this file</strong><span>Only xdrop devices discovered right now are included.</span></div><div class="field file-field"><label>CHOOSE FILES</label><label class="file-drop" id="drop-zone"><input id="file-input" type="file" multiple required><span class="drop-icon">↑</span><strong>Drop files here</strong><span class="drop-caption">or <b>browse files</b></span><span class="selected-file" id="selected-file">Select or drop multiple files to send them one by one.</span></label></div><div class="form-actions"><button class="button button-primary" type="submit">Send files securely <span>↗</span></button><button class="button button-quiet" type="button" data-view="overview">Cancel</button></div><div class="upload-progress" id="upload-progress"></div></form></div>`;
 }
 function transfersView() {
@@ -584,9 +620,223 @@ function settingsView() {
     <section class="setting-card"><h3>Pair another device</h3><p>Share your code, or scan a nearby xdrop code with this device’s camera.</p>${state.qr_available && state.local_ip ? `<div class="pairing-qr"><img src="/api/pairing.svg" alt="QR code for ${escapeHTML(state.local_ip)}:${state.port}"><div><strong>${escapeHTML(state.device_name)}</strong><span>Another device can scan this code and connect.</span><button class="button button-secondary button-small" type="button" data-action="scan-qr">▦ Scan a code</button></div></div>` : `<div class="qr-unavailable">${!state.qr_available ? 'Install xdrop dependencies to enable QR pairing.' : 'No local network address was detected.'}<button class="button button-secondary button-small" type="button" data-action="scan-qr">▦ Scan a code</button></div>`}<div class="copy-address-row"><div><span>Address and port</span><strong>${escapeHTML(state.local_ip ? `${state.local_ip}:${state.port}` : 'Address not detected')}</strong></div><button class="button button-quiet button-small" data-copy-address="${escapeHTML(state.local_ip ? `${state.local_ip}:${state.port}` : '')}" ${state.local_ip ? '' : 'disabled'}>Copy</button></div><div class="network-info"><span>Discovery</span><strong>${state.discovery.registered ? 'Available' : 'Limited'}</strong></div></section>
     <section class="setting-card"><h3>Privacy & security</h3><p>Files are encrypted in transit and SHA-256 checked before saving. Peer identity is not authenticated, so an active LAN attacker could intercept a connection.</p><div class="security-line"><span class="security-check">✓</span><span><strong>Encrypted transport</strong><small>X25519 · AES-256-GCM · SHA-256</small></span></div></section></div>`;
 }
+// ---------------------------------------------------------------------------
+// Packets: live network analyzer (records on the wire, encapsulation, path)
+// ---------------------------------------------------------------------------
+const pk = {transfer:'', seq:null, type:'', dir:'', paused:false, link:'wifi', live:null, detail:null, paths:{}, error:''};
+const TYPE_INFO = {
+  handshake_hello:{label:'HELLO', cls:'hs', about:'Key exchange (X25519). Sent in clear: 4-byte magic “PDIT”, 1-byte version, 32-byte public key. Contains no secret.'},
+  offer:{label:'OFFER', cls:'ctl', about:'Sender proposes a file: name, size, SHA-256, resume id.'},
+  response:{label:'RESPONSE', cls:'ctl', about:'Receiver accepts or rejects; includes the resume offset.'},
+  file_chunk:{label:'DATA', cls:'data', about:'One 64 KiB piece of the file, encrypted with AES-256-GCM.'},
+  done:{label:'DONE', cls:'ctl', about:'Sender finished; carries the SHA-256 of the whole file.'},
+  ack:{label:'ACK', cls:'ok', about:'Receiver confirms the SHA-256 matched (or reports a failure).'},
+  probe:{label:'PROBE', cls:'ctl', about:'Reachability / latency check.'},
+  probe_ack:{label:'PROBE-ACK', cls:'ok', about:'Answer to a probe.'},
+};
+const typeInfo = type => TYPE_INFO[type] || {label:String(type || 'RECORD').toUpperCase(), cls:'ctl', about:'xdrop control record.'};
+const fmtNum = n => Number(n || 0).toLocaleString();
+const pct = (a, b) => b ? `${(a / b * 100).toFixed(1)}%` : '—';
+function encap(frame, mss, link) {
+  mss = Math.max(88, Number(mss) || 1460);
+  const tcpH = mss <= 1460 ? Math.max(20, 1500 - 20 - mss) : 20;
+  const segs = Math.max(1, Math.ceil(frame / mss));
+  const linkH = link === 'wifi' ? 38 : 18;
+  return {mss, tcpH, ipH:20, linkH, segs, last: frame - (segs - 1) * mss, wire: frame + segs * (tcpH + 20 + linkH)};
+}
+function recordInfo(r) {
+  if (r.record_type === 'handshake_hello') return 'Public key exchange (unencrypted, no secrets)';
+  if (r.record_type === 'file_chunk') return `Encrypted file data · ${fmtNum(r.plaintext_bytes)} B of file`;
+  if (r.control) {
+    try {
+      const m = JSON.parse(r.control);
+      if (m.type === 'offer') return `File “${m.filename}” · ${size(m.size)} · sha256 ${String(m.sha256 || '').slice(0,10)}…`;
+      if (m.type === 'response') return m.accept ? `Accepted · resume offset ${fmtNum(m.offset || 0)}` : `Rejected · ${m.reason || ''}`;
+      if (m.type === 'done') return `Finished · sha256 ${String(m.sha256 || '').slice(0,16)}…`;
+      if (m.type === 'ack') return m.ok ? 'Integrity verified ✓' : `Verification failed · ${m.reason || ''}`;
+      return m.type || 'control';
+    } catch (_) {}
+  }
+  return typeInfo(r.record_type).about;
+}
+function pkRows() {
+  let rows;
+  if (pk.transfer) rows = pk.detail?.telemetry?.recent_records || [];
+  else rows = [...(pk.live?.feed || [])].reverse();
+  return rows.filter(r => (!pk.type || r.record_type === pk.type) && (!pk.dir || r.direction === pk.dir));
+}
+async function loadPackets() {
+  try {
+    pk.live = await request('/api/packets');
+    if (pk.transfer) {
+      pk.detail = await request(`/api/analyzer/${encodeURIComponent(pk.transfer)}?limit=1`);
+      const ip = pk.detail?.network?.remote_ip;
+      if (ip && !pk.paths[ip]) {
+        pk.paths[ip] = {loading:true};
+        request(`/api/path?ip=${encodeURIComponent(ip)}`).then(p => { pk.paths[ip] = p; if (currentView === 'packets') render(); }).catch(e => { pk.paths[ip] = {error:e.message}; });
+      }
+    } else pk.detail = null;
+    pk.error = '';
+  } catch (error) { pk.error = error.message; }
+}
+function hexBytes(hex, cls, title) {
+  if (!hex) return '';
+  return `<span class="hx ${cls}" title="${escapeHTML(title)}">${hex.match(/.{1,2}/g).join(' ')}</span>`;
+}
+function hexView(r) {
+  if (r.raw_hex) {
+    const h = r.raw_hex;
+    return `<div class="hex-line">${hexBytes(h.slice(0,8),'hx-magic','Magic “PDIT” (4 B)')} ${hexBytes(h.slice(8,10),'hx-len','Protocol version (1 B)')} ${hexBytes(h.slice(10),'hx-key','X25519 public key (32 B)')}</div>
+      <div class="hex-legend"><span class="hx-magic">magic “PDIT”</span><span class="hx-len">version</span><span class="hx-key">public key</span></div>`;
+  }
+  if (!r.header_hex) return '<div class="az-empty">No byte data recorded for this record.</div>';
+  const len = parseInt(r.header_hex.slice(24), 16);
+  const body = Math.max(0, r.ciphertext_bytes - 16);
+  const preview = (r.cipher_preview_hex || '').slice(0, Math.min(24, body) * 2);
+  const hidden = Math.max(0, body - 24);
+  return `<div class="hex-line">${hexBytes(r.header_hex.slice(0,24),'hx-nonce','Nonce, random per frame (12 B)')} ${hexBytes(r.header_hex.slice(24),'hx-len',`Length = ${len} (4 B, big-endian)`)} ${hexBytes(preview,'hx-ct','Ciphertext (encrypted data)')} ${hidden ? `<span class="hx-gap">… ${fmtNum(hidden)} more encrypted bytes …</span> ` : ''}${hexBytes(r.tag_hex,'hx-tag','GCM authentication tag (16 B)')}</div>
+    <div class="hex-legend"><span class="hx-nonce">nonce 12 B</span><span class="hx-len">length 4 B = ${fmtNum(len)}</span><span class="hx-ct">ciphertext</span><span class="hx-tag">GCM tag 16 B</span></div>`;
+}
+function packetDetail(r, mss, path) {
+  if (!r) return `<div class="pk-detail empty-detail"><strong>Select a packet</strong><span>Click any row to see how it is built, layer by layer.</span></div>`;
+  const info = typeInfo(r.record_type);
+  const e = encap(r.frame_bytes, mss, pk.link);
+  const encrypted = r.encrypted;
+  const tag = encrypted ? 16 : 0, hdr = encrypted ? 16 : 0;
+  const data = encrypted ? r.plaintext_bytes : r.frame_bytes;
+  const tcpTotal = e.segs * e.tcpH, ipTotal = e.segs * 20, linkTotal = e.segs * e.linkH;
+  const parts = [
+    ['Data', data, 'b-data'], ['GCM tag', tag, 'b-tag'], ['xdrop header', hdr, 'b-hdr'],
+    ['TCP headers', tcpTotal, 'b-tcp'], ['IP headers', ipTotal, 'b-ip'], [pk.link === 'wifi' ? 'Wi-Fi headers' : 'Ethernet headers', linkTotal, 'b-link'],
+  ].filter(p => p[1] > 0);
+  const bar = `<div class="byte-bar">${parts.map(p => `<i class="${p[2]}" style="flex:${Math.max(p[1], e.wire * 0.012)}" title="${p[0]}: ${fmtNum(p[1])} B"></i>`).join('')}</div><div class="byte-legend">${parts.map(p => `<span><i class="${p[2]}"></i>${p[0]} <b>${fmtNum(p[1])} B</b></span>`).join('')}</div>`;
+  const [srcIp, srcPort] = String(r.src || ':').split(':');
+  const [dstIp, dstPort] = String(r.dst || ':').split(':');
+  const mac = path?.peer_mac;
+  const stages = [
+    {n:'7', layer:'Application', title: r.record_type === 'file_chunk' ? 'File bytes read from disk' : r.record_type === 'handshake_hello' ? 'Handshake hello' : 'JSON control message', bytes: data, add: null, note: info.about},
+    ...(encrypted ? [
+      {n:'6', layer:'Encryption', title:'AES-256-GCM encrypt', bytes: r.ciphertext_bytes, add:`+${tag} B tag`, note:'Ciphertext is the same length as the data plus a 16-byte authentication tag that detects tampering.'},
+      {n:'5', layer:'xdrop framing', title:'Add frame header', bytes: r.frame_bytes, add:`+${hdr} B`, note:'12-byte random nonce + 4-byte length so the receiver knows where this record ends in the TCP stream.'},
+    ] : []),
+    {n:'4', layer:'Transport · TCP', title:`Split into ${fmtNum(e.segs)} segment${e.segs === 1 ? '' : 's'}`, bytes: r.frame_bytes + tcpTotal, add:`+${e.tcpH} B × ${e.segs}`, note:`Max ${fmtNum(e.mss)} B of payload per segment (MSS). Ports ${srcPort || '?'} → ${dstPort || '?'}. TCP numbers every byte so lost segments are re-sent.`},
+    {n:'3', layer:'Network · IPv4', title:`${fmtNum(e.segs)} IP packet${e.segs === 1 ? '' : 's'}`, bytes: r.frame_bytes + tcpTotal + ipTotal, add:`+20 B × ${e.segs}`, note:`${srcIp || '?'} → ${dstIp || '?'} · protocol 6 (TCP) · each packet ≤ 1500 B MTU.`},
+    {n:'2', layer: pk.link === 'wifi' ? 'Link · Wi-Fi 802.11' : 'Link · Ethernet', title:`${fmtNum(e.segs)} frame${e.segs === 1 ? '' : 's'} on the air`, bytes: e.wire, add:`+${e.linkH} B × ${e.segs}`, note: mac ? `Destination MAC ${mac} (from the ARP table).` : 'Addressed by MAC address; the access point forwards it to the peer.'},
+  ];
+  const stageHTML = stages.map((st, i) => `<div class="stage"><div class="stage-num">L${st.n}</div><div class="stage-body"><div class="stage-head"><span>${escapeHTML(st.layer)}</span><b>${fmtNum(st.bytes)} B</b>${st.add ? `<em>${escapeHTML(st.add)}</em>` : ''}</div><strong>${escapeHTML(st.title)}</strong><small>${escapeHTML(st.note)}</small></div></div>${i < stages.length - 1 ? '<div class="stage-arrow">↓</div>' : ''}`).join('');
+  const segShow = Math.min(e.segs, 48);
+  const segs = Array.from({length: segShow}, (_, i) => {
+    const payload = i === e.segs - 1 ? e.last : e.mss;
+    return `<i style="flex:${payload}" title="Segment ${i + 1}: ${fmtNum(payload)} B payload + ${e.tcpH + 20 + e.linkH} B headers"><span>${i + 1}</span></i>`;
+  }).join('');
+  let control = '';
+  if (r.control) { try { control = JSON.stringify(JSON.parse(r.control), null, 2); } catch (_) { control = r.control; } }
+  return `<div class="pk-detail">
+    <div class="pk-detail-head"><span class="pk-type ${info.cls}">${info.label}</span><div><strong>Packet #${r.sequence} · ${r.direction === 'sent' ? 'sent ↑' : 'received ↓'}</strong><small>${escapeHTML(r.src || '?')} → ${escapeHTML(r.dst || '?')} · t = ${Number(r.time_ms || 0).toFixed(1)} ms</small></div></div>
+    <div class="pk-kpis"><div><span>Data</span><b>${fmtNum(data)} B</b></div><div><span>Frame</span><b>${fmtNum(r.frame_bytes)} B</b></div><div><span>On the wire*</span><b>${fmtNum(e.wire)} B</b></div><div><span>Efficiency</span><b>${pct(data, e.wire)}</b></div></div>
+    <h4>How this packet is built</h4>${bar}
+    <div class="stages">${stageHTML}</div>
+    <h4>TCP segmentation* <small>${fmtNum(e.segs)} segment${e.segs === 1 ? '' : 's'} of ≤ ${fmtNum(e.mss)} B${e.segs > segShow ? ` · first ${segShow} shown` : ''}</small></h4><div class="seg-ladder">${segs}</div>
+    <h4>Real bytes on the wire</h4>${hexView(r)}
+    ${control ? `<h4>Decoded control message</h4><pre class="pk-json">${escapeHTML(control)}</pre>` : ''}
+    <p class="pk-foot">* TCP/IP/link sizes are calculated from the measured MSS and standard header sizes. TCP is a byte stream, so the OS may merge small records or split large ones differently. Record sizes, timings, header bytes and the kernel TCP counters are measured.</p>
+  </div>`;
+}
+function timelineChart(timeline) {
+  if (!timeline?.length) return '<div class="traffic-empty">No timeline yet.</div>';
+  const w = 640, h = 150, pad = 26;
+  const maxT = Math.max(...timeline.map(b => b.t), 0.25);
+  const peak = Math.max(...timeline.map(b => (b.sent_bytes || 0) + (b.received_bytes || 0)), 1);
+  const bw = Math.min(14, Math.max(2, (w - pad * 2) / ((maxT / 0.25) + 2) - 1));
+  const bars = timeline.map(b => {
+    const x = pad + b.t / (maxT + 0.25) * (w - pad * 2);
+    const hs = (b.sent_bytes || 0) / peak * (h - pad * 1.6), hr = (b.received_bytes || 0) / peak * (h - pad * 1.6);
+    return `<rect class="tl-sent" x="${x.toFixed(1)}" y="${(h - pad - hs).toFixed(1)}" width="${bw.toFixed(1)}" height="${hs.toFixed(1)}"><title>${b.t}s · sent ${size(b.sent_bytes || 0)}</title></rect><rect class="tl-recv" x="${x.toFixed(1)}" y="${(h - pad - hs - hr).toFixed(1)}" width="${bw.toFixed(1)}" height="${hr.toFixed(1)}"><title>${b.t}s · received ${size(b.received_bytes || 0)}</title></rect>`;
+  }).join('');
+  return `<svg class="timeline" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><line x1="${pad}" y1="${h - pad}" x2="${w - pad}" y2="${h - pad}" class="tl-axis"/>${bars}<text x="${pad}" y="${h - 8}">0 s</text><text x="${w - pad}" y="${h - 8}" text-anchor="end">${(maxT + 0.25).toFixed(2)} s</text><text x="${pad}" y="14">peak ${size(peak)} / 250 ms</text></svg><div class="byte-legend"><span><i class="tl-sent"></i>Sent</span><span><i class="tl-recv"></i>Received</span></div>`;
+}
+function tcpCard(tel) {
+  const tcp = tel?.tcp;
+  if (!tcp?.last) return `<div class="pk-card"><h3>Kernel TCP counters</h3><p class="pk-muted">This operating system does not expose per-connection TCP counters to Python (Windows). Segment counts are estimated from the MSS instead.</p><div class="az-kv"><div class="az-kv-row"><span>MSS</span><strong>${fmtNum(tel?.mss)} B ${tel?.mss_measured ? '(measured)' : '(default)'}</strong></div></div></div>`;
+  const l = tcp.last;
+  const row = (k, v) => v == null || v === '' ? '' : `<div class="az-kv-row"><span>${k}</span><strong>${v}</strong></div>`;
+  return `<div class="pk-card"><h3>Kernel TCP counters <span class="measured">measured</span></h3><p class="pk-muted">Read from ${escapeHTML(l.source)} for this connection.</p><div class="az-kv">
+    ${row('MSS (max segment)', `${fmtNum(l.snd_mss)} B`)}
+    ${row('Round-trip time', l.rtt_ms != null ? `${Number(l.rtt_ms).toFixed(2)} ms ± ${Number(l.rttvar_ms || 0).toFixed(2)}` : null)}
+    ${row('TCP segments sent', tcp.delta_segs_out != null ? fmtNum(tcp.delta_segs_out) : null)}
+    ${row('TCP segments received', tcp.delta_segs_in != null ? fmtNum(tcp.delta_segs_in) : null)}
+    ${row('Retransmissions', tcp.delta_total_retrans != null ? fmtNum(tcp.delta_total_retrans) : null)}
+    ${row('Bytes acknowledged', tcp.delta_bytes_acked != null ? size(tcp.delta_bytes_acked) : null)}
+    ${row('Congestion window', l.snd_cwnd != null ? `${fmtNum(l.snd_cwnd)} segments` : null)}
+    ${row('Path MTU', l.pmtu ? `${fmtNum(l.pmtu)} B` : null)}
+  </div></div>`;
+}
+function pathCard(path, net) {
+  if (!net?.remote_ip) return '';
+  if (!path || path.loading) return `<div class="pk-card"><h3>Network path</h3><p class="pk-muted">Looking up gateway and ARP table…</p></div>`;
+  if (path.error) return `<div class="pk-card"><h3>Network path</h3><p class="pk-muted">${escapeHTML(path.error)}</p></div>`;
+  const icon = {source:'⌂', switch:'⇌', router:'▣', destination:'◎'};
+  return `<div class="pk-card"><h3>Network path</h3><p class="pk-muted">${path.same_link ? 'Both devices are on the same subnet: one hop through the access point, no router.' : 'Different subnets: packets are routed.'}</p>
+    <div class="path-hops">${(path.hops || []).map((h, i) => `<div class="path-hop ${h.kind}"><span>${icon[h.kind] || '•'}</span><div><strong>${escapeHTML(h.title)}</strong><b>${escapeHTML(h.ip || '—')}</b><small>${escapeHTML(h.detail || '')}</small></div></div>${i < path.hops.length - 1 ? '<div class="path-link"></div>' : ''}`).join('')}</div>
+    <button class="button button-quiet button-small" data-route-trace="${escapeHTML(`${net.remote_ip}:${net.remote_port || 0}`)}" data-transfer-id="${escapeHTML(pk.transfer)}">⌁ Run traceroute</button></div>`;
+}
+function typeTable(tel) {
+  const rows = tel?.by_type || [];
+  if (!rows.length) return '';
+  return `<div class="pk-card pk-wide"><h3>Packet types in this transfer</h3><div class="pk-type-table"><div class="pk-tt-head"><span>Type</span><span>Dir</span><span>Count</span><span>Data</span><span>Frames</span><span>Overhead</span><span>TCP segs*</span></div>
+    ${rows.map(r => `<div><span><b class="pk-type ${typeInfo(r.record_type).cls}">${typeInfo(r.record_type).label}</b></span><span>${r.direction === 'sent' ? '↑ sent' : '↓ recv'}</span><span>${fmtNum(r.records)}</span><span>${size(r.plaintext_bytes)}</span><span>${size(r.frame_bytes)}</span><span>${fmtNum(r.overhead_bytes)} B</span><span>${fmtNum(r.tcp_segments_est)}</span></div>`).join('')}</div></div>`;
+}
+function packetsView() {
+  if (!pk.live && !pk.error) { loadPackets().then(() => { if (currentView === 'packets') render(); }); }
+  const transfers = (pk.live?.transfers || []).slice().sort((a, b) => b.started_at - a.started_at);
+  const rows = pkRows();
+  const tel = pk.detail?.telemetry;
+  const mss = tel?.mss || 1460;
+  const rowKey = r => pk.transfer ? String(r.sequence) : `${r.transfer_id}:${r.sequence}`;
+  if (pk.seq == null || !rows.some(r => rowKey(r) === pk.seq)) {
+    const firstData = rows.find(r => r.record_type === 'file_chunk') || rows[0];
+    pk.seq = firstData ? rowKey(firstData) : null;
+  }
+  const selected = rows.find(r => rowKey(r) === pk.seq);
+  const totals = pk.transfer ? (tel?.totals || {}) : (pk.live?.totals || {});
+  const net = pk.detail?.network;
+  const path = net?.remote_ip ? pk.paths[net.remote_ip] : null;
+  const types = [...new Set(rows.map(r => r.record_type).concat(Object.keys(TYPE_INFO)))];
+  const tableRows = rows.length ? rows.slice(0, 600).map(r => {
+    const info = typeInfo(r.record_type);
+    const e = encap(r.frame_bytes, r.mss || mss, pk.link);
+    return `<button class="pk-row ${rowKey(r) === pk.seq ? 'selected' : ''} ${r.direction}" data-pk-seq="${escapeHTML(rowKey(r))}"><span>${r.sequence}</span><span>${Number(r.time_ms || 0).toFixed(1)}</span><span class="pk-addr">${escapeHTML(r.src || '?')} → ${escapeHTML(r.dst || '?')}</span><span><b class="pk-type ${info.cls}">${info.label}</b></span><span>${fmtNum(r.frame_bytes)}</span><span>${fmtNum(r.tcp_segments_est ?? e.segs)}</span><span class="pk-info">${escapeHTML(recordInfo(r))}</span></button>`;
+  }).join('') : `<div class="pk-empty"><strong>No packets captured yet</strong>Send or receive a file — every record is captured live, with no admin rights needed.</div>`;
+  const liveNote = !pk.transfer ? `<div class="pk-hint">Live feed across all transfers (newest first). Pick a transfer above to see its full packet list, timeline, kernel TCP counters and network path.</div>` : '';
+  return `${heading('NETWORK ANALYZER','Packets','Every record xdrop puts on the network: what type it is, how it is encrypted, how it is split into TCP/IP packets, and which path it takes.', `<div class="pk-actions"><button class="button button-quiet button-small" data-pk-action="pause">${pk.paused ? '▶ Resume' : 'Ⅱ Pause'}</button></div>`)}
+    ${pk.error ? `<div class="route-error">${escapeHTML(pk.error)}</div>` : ''}
+    <div class="pk-toolbar">
+      <select id="pk-transfer" aria-label="Transfer"><option value="">● Live · all transfers</option>${transfers.map(t => `<option value="${escapeHTML(t.id)}" ${pk.transfer === t.id ? 'selected' : ''}>${escapeHTML(t.label || t.id)} · ${fmtNum(t.records)} pkts</option>`).join('')}</select>
+      <select id="pk-type" aria-label="Packet type"><option value="">All types</option>${types.map(t => `<option value="${escapeHTML(t)}" ${pk.type === t ? 'selected' : ''}>${typeInfo(t).label}</option>`).join('')}</select>
+      <select id="pk-dir" aria-label="Direction"><option value="">Both directions</option><option value="sent" ${pk.dir === 'sent' ? 'selected' : ''}>Sent ↑</option><option value="received" ${pk.dir === 'received' ? 'selected' : ''}>Received ↓</option></select>
+      <select id="pk-link" aria-label="Link layer"><option value="wifi" ${pk.link === 'wifi' ? 'selected' : ''}>Link: Wi-Fi 802.11</option><option value="ethernet" ${pk.link === 'ethernet' ? 'selected' : ''}>Link: Ethernet</option></select>
+    </div>
+    <div class="pk-stats">
+      <div class="stat-card"><div class="stat-text"><span>PACKETS (RECORDS)</span><strong>${fmtNum(totals.records)}</strong><small>${pk.transfer && tel ? `${fmtNum(tel.records_kept)} kept for display` : 'captured this session'}</small></div></div>
+      <div class="stat-card"><div class="stat-text"><span>FRAME BYTES</span><strong>${size(totals.frame_bytes || 0)}</strong><small>${pk.transfer ? `${pct(totals.overhead_bytes, totals.frame_bytes)} encryption + framing overhead` : 'xdrop frames on TCP'}</small></div></div>
+      <div class="stat-card"><div class="stat-text"><span>TCP SEGMENTS</span><strong>${tel?.tcp?.delta_segs_out != null ? fmtNum((tel.tcp.delta_segs_out || 0) + (tel.tcp.delta_segs_in || 0)) : fmtNum(totals.tcp_segments_est)}</strong><small>${tel?.tcp?.delta_segs_out != null ? 'measured by the kernel (in + out)' : 'estimated from MSS'}</small></div></div>
+      <div class="stat-card"><div class="stat-text"><span>ON THE WIRE*</span><strong>${size(totals.wire_bytes_est || 0)}</strong><small>incl. TCP, IP and link headers</small></div></div>
+    </div>
+    ${liveNote}
+    <div class="pk-layout">
+      <section class="card pk-capture"><div class="pk-head-row"><span>No.</span><span>Time ms</span><span>Source → Destination</span><span>Type</span><span>Bytes</span><span>Segs*</span><span>Info</span></div><div class="pk-table-wrap">${tableRows}</div></section>
+      <aside class="card pk-side">${packetDetail(selected, selected?.mss || mss, path)}</aside>
+    </div>
+    ${pk.transfer && tel ? `<div class="pk-grid">
+      <div class="pk-card pk-wide"><h3>Throughput timeline</h3>${timelineChart(tel.timeline)}</div>
+      ${typeTable(tel)}
+      ${tcpCard(tel)}
+      ${pathCard(path, net)}
+    </div>` : ''}`;
+}
 function render() {
   if (!state) { root.innerHTML = '<div class="loading"><div><div class="spinner"></div>Connecting to your xdrop device…</div></div>'; return; }
-  const names = {overview:'Overview',devices:'Devices',send:'Send a file',transfers:'Transfers',traffic:'Traffic',insights:'Insights',settings:'Settings'};
+  const names = {overview:'Overview',devices:'Devices',send:'Send a file',transfers:'Transfers',traffic:'Traffic',packets:'Packets',insights:'Insights',settings:'Settings'};
   pageName.textContent = names[currentView] || 'Overview';
   document.querySelector('#profile-name').textContent = state.device_name;
   document.querySelector('#avatar').textContent = (state.device_name || 'x').slice(0,1).toUpperCase();
@@ -596,11 +846,22 @@ function render() {
   connection.classList.toggle('online', Boolean(state.discovery.zeroconf_active));
   document.querySelector('#connection-label').textContent = state.discovery.zeroconf_active ? 'Network active' : 'Local only';
   document.querySelectorAll('.nav-item[data-view]').forEach(button => button.classList.toggle('active', button.dataset.view === currentView));
-  root.innerHTML = ({overview,devices:devicesView,send:sendView,transfers:transfersView,traffic:trafficView,insights:insightsView,settings:settingsView}[currentView] || overview)();
+  const tableScroll = root.querySelector('.pk-table-wrap')?.scrollTop || 0;
+  const sideScroll = root.querySelector('.pk-side')?.scrollTop || 0;
+  root.classList.toggle('wide', currentView === 'packets');
+  root.innerHTML = ({overview,devices:devicesView,send:sendView,transfers:transfersView,traffic:trafficView,packets:packetsView,insights:insightsView,settings:settingsView}[currentView] || overview)();
+  if (currentView === 'packets') {
+    const wrap = root.querySelector('.pk-table-wrap'); if (wrap) wrap.scrollTop = tableScroll;
+    const side = root.querySelector('.pk-side'); if (side) side.scrollTop = sideScroll;
+  }
   if (currentView === 'transfers') applyHistoryFilters();
 }
 async function refresh() {
-  try { state = await request('/api/state'); render(); }
+  try {
+    state = await request('/api/state');
+    if (currentView === 'packets' && !pk.paused) await loadPackets();
+    render();
+  }
   catch (error) { document.querySelector('#connection-label').textContent = 'Offline'; notify(error.message, true); }
 }
 function switchView(view, peer = '') {
@@ -618,6 +879,27 @@ document.addEventListener('click', async event => {
   const analyzeCard = event.target.closest('[data-analyze-id]');
   if (analyzeCard && !event.target.closest('button') && !event.target.closest('.incoming-actions')) {
     await analyzeTransfer(analyzeCard.dataset.analyzeId);
+    return;
+  }
+  const pkRow = event.target.closest('[data-pk-seq]');
+  if (pkRow) {
+    const key = pkRow.dataset.pkSeq;
+    if (!pk.transfer && key.includes(':')) {   // live feed → drill into that transfer
+      const [transferId, seq] = key.split(':');
+      pk.transfer = transferId; pk.seq = seq; pk.type = ''; pk.dir = '';
+      await loadPackets();
+    } else pk.seq = key;
+    render();
+    return;
+  }
+  const pkAction = event.target.closest('[data-pk-action]');
+  if (pkAction?.dataset.pkAction === 'pause') { pk.paused = !pk.paused; render(); return; }
+  const openPackets = event.target.closest('[data-open-packets]');
+  if (openPackets) {
+    pk.transfer = openPackets.dataset.openPackets; pk.seq = null; pk.type = ''; pk.dir = '';
+    closeAnalyzer();
+    await loadPackets();
+    switchView('packets');
     return;
   }
   const nav = event.target.closest('[data-view]');
@@ -721,6 +1003,13 @@ document.addEventListener('click', async event => {
     return;
   }
   if (action?.dataset.action === 'send') { switchView('send'); return; }
+  if (action?.dataset.action === 'scan-network') {
+    action.disabled = true; action.textContent = 'Scanning…';
+    try { await request('/api/scan', {method:'POST'}); notify('Scanning your network for xdrop devices…'); }
+    catch (error) { notify(error.message, true); }
+    setTimeout(refresh, 2500);
+    return;
+  }
   if (action?.dataset.action === 'scan-qr') { await startQrScanner(); return; }
   if (action?.dataset.action === 'close-scanner') { closeQrScanner(); return; }
   if (action?.dataset.action === 'refresh' || event.target.closest('#refresh')) { await refresh(); notify('Updated'); return; }
@@ -792,6 +1081,16 @@ document.addEventListener('change', event => {
       ? `<b>${escapeHTML(files[0].name)}</b> · ${size(totalBytes)}`
       : `<b>${files.length} files selected</b> · ${size(totalBytes)} total`;
   }
+  if (['pk-transfer','pk-type','pk-dir','pk-link'].includes(event.target.id)) {
+    const v = event.target.value;
+    if (event.target.id === 'pk-transfer') { pk.transfer = v; pk.seq = null; pk.type = ''; pk.dir = ''; }
+    if (event.target.id === 'pk-type') { pk.type = v; pk.seq = null; }
+    if (event.target.id === 'pk-dir') { pk.dir = v; pk.seq = null; }
+    if (event.target.id === 'pk-link') pk.link = v;
+    event.target.blur();
+    loadPackets().then(render);
+    return;
+  }
   if (event.target.id === 'history-direction') { historyDirection = event.target.value; applyHistoryFilters(); }
   if (event.target.id === 'history-status') { historyStatus = event.target.value; applyHistoryFilters(); }
 });
@@ -845,7 +1144,8 @@ document.addEventListener('submit', async event => {
       if (!files.length) throw new Error('Choose at least one file to send');
       let endpoints = [];
       if (mode === 'unicast') {
-        const target = root.querySelector('#peer-target').value || root.querySelector('#manual-peer').value.trim();
+        let target = root.querySelector('#peer-target').value || root.querySelector('#manual-peer').value.trim();
+        if (target && !/:\d+$/.test(target)) target = `${target}:${state.default_port || 47474}`;
         const match = target.match(/^(.*):(\d+)$/);
         if (!match || !match[1] || Number(match[2]) < 1 || Number(match[2]) > 65535) throw new Error('Enter a device address and port, or choose a nearby device');
         endpoints = [`${match[1]}:${match[2]}`];
