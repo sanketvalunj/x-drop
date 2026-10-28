@@ -64,11 +64,7 @@ def test_direct_endpoint_parsing():
 
 
 def test_atomic_write_and_cleanup_on_truncation():
-    """Verify that if a socket drops mid-transfer:
-    1. The partial .part file is immediately unlinked.
-    2. No corrupt final file is created.
-    3. Status is marked STATUS_FAILED.
-    """
+    """Interrupted transfers retain resumable partial data and never create a final file."""
     tmp = Path(tempfile.mkdtemp(prefix="pdit_test_atomic_"))
     dst_dir = tmp / "downloads"
     dst_dir.mkdir()
@@ -112,15 +108,37 @@ def test_atomic_write_and_cleanup_on_truncation():
         time.sleep(0.05)
 
     rx.stop()
-
-    # Verify no partial files or final files exist in download directory
     remaining_files = list(dst_dir.iterdir())
-    assert len(remaining_files) == 0, f"Expected clean dir, found {remaining_files}"
-
+    assert any(path.suffix in {".part", ".json"} for path in remaining_files), f"Expected resumable files, found {remaining_files}"
+    assert not (dst_dir / src.name).exists()
     h = rx.history()
     assert len(h) == 1
     assert h[0].status == STATUS_FAILED
 
+
+def test_receiver_uses_default_port_and_falls_back_when_busy():
+    from xdrop.transfer import DEFAULT_RECEIVER_PORT
+    occupied = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    occupied.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    occupied.bind(("0.0.0.0", DEFAULT_RECEIVER_PORT))
+    occupied.listen(1)
+    try:
+        rx = ReceiverServer(get_download_dir=lambda: Path(tempfile.mkdtemp()), get_device_name=lambda: "receiver")
+        rx.start()
+        try:
+            assert rx.port != DEFAULT_RECEIVER_PORT
+            assert rx.port > 0
+        finally:
+            rx.stop()
+    finally:
+        occupied.close()
+
+    rx = ReceiverServer(get_download_dir=lambda: Path(tempfile.mkdtemp()), get_device_name=lambda: "receiver")
+    rx.start()
+    try:
+        assert rx.port == DEFAULT_RECEIVER_PORT
+    finally:
+        rx.stop()
 
 def test_storage_preflight_rejection():
     """Verify that if target directory does not have enough storage, offer is rejected."""

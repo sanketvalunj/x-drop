@@ -31,6 +31,7 @@ from .config import Config
 from .discovery import DiscoveryService, Peer, _primary_ipv4, parse_peer_endpoint
 from .logger import LOG_FILE, get_logger, get_recent_logs, init_logging
 from .transfer import (
+    DEFAULT_RECEIVER_PORT,
     MAX_CONCURRENT_SESSIONS,
     STATUS_ACTIVE,
     STATUS_CANCELLED,
@@ -145,11 +146,12 @@ def _onboard(cfg: Config) -> None:
 def _firewall_warning() -> None:
     if os.name == "nt":
         console.print(
-            "[yellow]Heads-up:[/yellow] Windows may show a one-time "
-            "[bold]'Allow an app to communicate'[/bold] dialog. "
-            "Click [bold]Allow[/bold] on private networks. "
-            "[dim](no admin password needed)[/dim]"
+            "[yellow]Firewall help:[/yellow] Allow Python on [bold]Private networks[/bold] "
+            "and set this Wi-Fi network to [bold]Private[/bold]. "
+            f"Optional admin command: [dim]netsh advfirewall firewall add rule name=\"xdrop TCP\" dir=in action=allow protocol=TCP localport={DEFAULT_RECEIVER_PORT}[/dim]"
         )
+    elif sys.platform == "darwin":
+        console.print("[dim]Firewall help: allow incoming connections for Python under System Settings → Network → Firewall.[/dim]")
     else:
         console.print("[dim]Opening LAN socket… (no admin/root required)[/dim]")
 
@@ -420,7 +422,7 @@ def _prompt_manual_peer(default_port: int) -> Optional[Peer]:
 
 def _pick_peer(disc: DiscoveryService, cfg: Config) -> Optional[Peer]:
     # Brief active scan so the user sees results quickly
-    deadline = time.time() + 2.5
+    deadline = time.time() + 10.0
     while time.time() < deadline and not disc.peers():
         time.sleep(0.25)
     peers = disc.peers()
@@ -429,7 +431,8 @@ def _pick_peer(disc: DiscoveryService, cfg: Config) -> Optional[Peer]:
     if not peers:
         console.print(
             "[yellow]No peers found via auto-discovery.[/yellow]\n"
-            "[dim]Enter [cyan]m[/cyan] to connect directly by IP, or ensure both devices are on the same LAN.[/dim]"
+            "[dim]The network may block mDNS or isolate clients (common on college Wi-Fi). Try a phone hotspot or connect by IP.\n"
+            f"This device: {disc.local_ip or _primary_ipv4() or 'IP unavailable'}:{disc.port}. Enter [cyan]m[/cyan] to connect directly.[/dim]"
         )
         raw = Prompt.ask("\n[bold]Option[/bold] [[cyan]m[/cyan] for direct IP / blank to cancel]", default="").strip().lower()
         if raw in ("m", "manual"):
@@ -765,6 +768,7 @@ def main() -> None:
     rx = ReceiverServer(
         get_download_dir=lambda: cfg.ensure_download_dir(),
         get_device_name=lambda: cfg.device_name,
+        port=cfg.port,
     )
     console.print()
     _firewall_warning()
@@ -773,6 +777,7 @@ def main() -> None:
     disc = DiscoveryService(cfg.device_name, rx.port)
     disc.start()
     ip = disc.local_ip or _primary_ipv4()
+    console.print(f"[bold cyan]This device address: {ip or 'IP unavailable'}:{rx.port}[/bold cyan]")
 
     # Friendly LAN diagnostics so users aren't confused when discovery is silent.
     if ip is None:

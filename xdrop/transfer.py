@@ -47,6 +47,7 @@ MAX_CONCURRENT_SESSIONS = 4 # maximum simultaneous incoming transfers
 MAX_HISTORY = 100           # maximum retained transfers in memory
 MAX_EVENTS_PER_TRANSFER = 200  # cap per-transfer event log to bound memory
 PROGRESS_EVENT_INTERVAL_S = 3.0  # minimum seconds between progress events
+DEFAULT_RECEIVER_PORT = 47474
 
 
 def probe_peer(address: str, port: int, timeout: float = 5.0) -> float:
@@ -557,11 +558,12 @@ class ReceiverServer:
     The CLI consumes ``transfers`` for both pending and historical entries.
     """
 
-    def __init__(self, get_download_dir: Callable[[], Path], get_device_name: Callable[[], str]):
+    def __init__(self, get_download_dir: Callable[[], Path], get_device_name: Callable[[], str], port: int = DEFAULT_RECEIVER_PORT):
         self._get_dir = get_download_dir
         self._get_name = get_device_name
         self._sock: Optional[socket.socket] = None
         self.port: int = 0
+        self.requested_port = port
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
@@ -574,7 +576,17 @@ class ReceiverServer:
     def start(self) -> None:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("0.0.0.0", 0))
+        try:
+            s.bind(("0.0.0.0", self.requested_port))
+        except OSError as e:
+            if self.requested_port == 0:
+                s.close()
+                raise
+            log.warning(f"Receiver port {self.requested_port} is busy ({e}); falling back to a random port")
+            s.close()
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", 0))
         s.listen(8)
         self.port = s.getsockname()[1]
         self._sock = s

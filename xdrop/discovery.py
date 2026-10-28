@@ -173,7 +173,7 @@ class _Listener(ServiceListener):
                     )
                     for entry in offline[:max(0, len(self._peer_history) - 100)]:
                         self._peer_history.pop(entry.service, None)
-            log.debug(f"Discovered peer {peer.name} @ {peer.endpoint}")
+            log.info(f"Received peer address {peer.name} @ {peer.endpoint}")
         except Exception as e:
             log.warning(f"Error refreshing service {name}: {e}")
 
@@ -232,6 +232,8 @@ class DiscoveryService:
             except Exception as e:
                 log.warning(f"Failed to encode IP {ip}: {e}")
                 addresses = []
+        for advertised_ip in addresses:
+            log.info(f"Advertising interface IP {socket.inet_ntoa(advertised_ip)}:{self.port}")
         if not HAS_ZEROCONF:
             self.last_error = "zeroconf package not installed (mDNS discovery disabled)"
             log.warning(self.last_error)

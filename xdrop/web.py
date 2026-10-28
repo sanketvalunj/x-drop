@@ -279,6 +279,7 @@ def _transfer_data(transfer: IncomingTransfer) -> dict:
 
 class Dashboard:
     def __init__(self) -> None:
+        self.started_at = time.time()
         init_logging()
         self.config = Config.load()
         if not self.config.has_device_name:
@@ -288,6 +289,7 @@ class Dashboard:
         self.receiver = ReceiverServer(
             get_download_dir=self.config.ensure_download_dir,
             get_device_name=lambda: self.config.device_name,
+            port=self.config.port,
         )
         self.receiver.start()
         self.discovery = DiscoveryService(self.config.device_name, self.receiver.port)
@@ -316,6 +318,7 @@ class Dashboard:
             "download_dir": str(self.config.download_dir),
             "local_ip": diagnostics.get("local_ip") or _primary_ipv4(),
             "port": self.receiver.port,
+            "started_at": self.started_at,
             "qr_available": HAS_QR,
             "discovery": diagnostics,
             "peers": [
@@ -637,6 +640,7 @@ class DashboardServer(ThreadingHTTPServer):
 
     def __init__(self, address, dashboard: Dashboard):
         self.dashboard = dashboard
+        self.allow_lan = address[0] == "0.0.0.0"
         super().__init__(address, DashboardHandler)
 
 
@@ -674,10 +678,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _local_request(self) -> bool:
         host = self.headers.get("Host", "").split(":", 1)[0].strip("[]").lower()
-        if host not in {"localhost", "127.0.0.1", "::1"}:
+        is_local = host in {"localhost", "127.0.0.1", "::1"}
+        if not is_local and getattr(self.server, "allow_lan", False):
+            try:
+                is_local = ipaddress.ip_address(host).is_private
+            except ValueError:
+                is_local = False
+        if not is_local:
             return False
         origin = self.headers.get("Origin")
-        return not origin or origin.startswith("http://localhost:") or origin.startswith("http://127.0.0.1:")
+        if not origin:
+            return True
+        origin_host = urlsplit(origin).hostname or ""
+        if origin_host in {"localhost", "127.0.0.1"}:
+            return True
+        if getattr(self.server, "allow_lan", False):
+            try:
+                return ipaddress.ip_address(origin_host).is_private
+            except ValueError:
+                return False
+        return False
 
 
 
@@ -713,7 +733,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 endpoint = str(self._read_json().get("endpoint", "")).strip()
                 if not re.fullmatch(r"[^:]+:\d+", endpoint):
                     raise ValueError("Enter an IP address or hostname followed by a port, such as 192.168.1.24:50000")
-                peer = parse_peer_endpoint(endpoint, 0)
+                peer = parse_peer_endpoint(endpoint, dashboard.receiver.port)
                 if not peer:
                     raise ValueError("That address or port is not valid. Check both and try again.")
                 self._json(200, {"ok": True, "address": peer.address, "port": peer.port, "label": f"{peer.address}:{peer.port}"})
@@ -721,7 +741,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             if parsed.path == "/api/quality":
                 endpoint = str(self._read_json().get("endpoint", "")).strip()
-                peer = parse_peer_endpoint(endpoint, 0)
+                peer = parse_peer_endpoint(endpoint, dashboard.receiver.port)
                 if not peer:
                     raise ValueError("Enter a valid peer address and port")
                 self._json(200, dashboard.check_peer_quality(peer.address, peer.port))
@@ -731,7 +751,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 body = self._read_json()
                 endpoint = str(body.get("endpoint", "")).strip()
                 transfer_id = str(body.get("transfer_id", "")).strip()
-                peer = parse_peer_endpoint(endpoint, 0)
+                peer = parse_peer_endpoint(endpoint, dashboard.receiver.port)
                 if not peer:
                     raise ValueError("Enter a valid peer address and port")
                 # Accept both incoming and outgoing transfers; check endpoint matches
@@ -835,7 +855,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/network-diag":
                 body = self._read_json()
                 endpoint = str(body.get("endpoint", "")).strip()
-                peer = parse_peer_endpoint(endpoint, 0)
+                peer = parse_peer_endpoint(endpoint, dashboard.receiver.port)
                 if not peer:
                     raise ValueError("Enter a valid peer address and port")
                 local_ip = dashboard.discovery.local_ip or _primary_ipv4()
@@ -887,14 +907,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         raise ValueError("Select at least one discovered device for multicast")
                     recipients = []
                     for endpoint in dict.fromkeys(selected_endpoints):
-                        peer = parse_peer_endpoint(endpoint, 0)
+                        peer = parse_peer_endpoint(endpoint, self.server.dashboard.receiver.port)
                         if not peer or peer.endpoint not in available:
                             raise ValueError("A selected device is no longer available. Refresh and try again")
                         recipients.append(available[peer.endpoint])
                 else:
                     if len(selected_endpoints) != 1:
                         raise ValueError("Unicast needs exactly one device")
-                    peer = parse_peer_endpoint(selected_endpoints[0], 0)
+                    peer = parse_peer_endpoint(selected_endpoints[0], self.server.dashboard.receiver.port)
                     if not peer:
                         raise ValueError("Enter a valid IP address or hostname and port")
                     recipients = [peer]
@@ -1021,12 +1041,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(prog="xdrop-web")
+    parser.add_argument("--lan", action="store_true", help="allow dashboard access from private LAN IPs")
+    args = parser.parse_args()
     dashboard = Dashboard()
     server = None
     try:
-        server = DashboardServer(("127.0.0.1", 8765), dashboard)
+        bind_ip = "0.0.0.0" if args.lan else "127.0.0.1"
+        server = DashboardServer((bind_ip, 8765), dashboard)
         url = "http://127.0.0.1:8765"
-        print(f"xdrop dashboard is running at {url} (local computer only)")
+        print(f"xdrop dashboard is running at {url}{' (LAN access enabled)' if args.lan else ' (local computer only)'}")
+        if os.name == "nt":
+            print("Firewall help: allow Python on Private networks and set this Wi-Fi network to Private.")
+        elif sys.platform == "darwin":
+            print("Firewall help: allow incoming connections for Python under System Settings → Network → Firewall.")
         webbrowser.open(url)
         server.serve_forever()
     except KeyboardInterrupt:

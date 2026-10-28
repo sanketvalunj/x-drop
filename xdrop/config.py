@@ -15,6 +15,7 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 # IMPORTANT: must NOT be ~/xdrop — that would shadow the package name
 # when Python is run from the home directory ('' in sys.path resolves to ~/).
 DEFAULT_DOWNLOAD_DIR = Path.home() / "xdrop_files"
+DEFAULT_RECEIVER_PORT = 47474
 
 
 def _default_device_name() -> str:
@@ -83,6 +84,21 @@ class Config:
     @property
     def has_device_name(self) -> bool:
         return bool(self._data.get("device_name"))
+
+    @property
+    def port(self) -> int:
+        try:
+            value = int(self._data.get("port", DEFAULT_RECEIVER_PORT))
+            return value if 1 <= value <= 65535 else DEFAULT_RECEIVER_PORT
+        except (TypeError, ValueError):
+            return DEFAULT_RECEIVER_PORT
+
+    @port.setter
+    def port(self, value: int) -> None:
+        value = int(value)
+        if not 1 <= value <= 65535:
+            raise ValueError("port must be between 1 and 65535")
+        self._data["port"] = value
 
     # download dir
     @property
