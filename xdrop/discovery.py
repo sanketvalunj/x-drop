@@ -117,21 +117,51 @@ class _Listener(ServiceListener):
         try:
             info = zc.get_service_info(type_, name, timeout=1500)
             if not info:
+                # mDNS service records can arrive before their address/TXT
+                # records. A one-shot lookup loses that peer permanently if
+                # the follow-up update packet is dropped, so retry resolution
+                # asynchronously without blocking zeroconf's browser thread.
+                threading.Thread(
+                    target=self._retry_refresh,
+                    args=(zc, type_, name),
+                    name="xdrop-discovery-retry",
+                    daemon=True,
+                ).start()
                 return
-            if name == self._get_self():
-                return  # ignore self
-            addrs = info.parsed_addresses(IPVersion.V4Only) or []
-            if not addrs:
-                return
-            txt_name = None
+            self._store_info(info, name)
+        except Exception as e:
+            log.warning(f"Error refreshing service {name}: {e}")
+
+    def _retry_refresh(self, zc: Zeroconf, type_: str, name: str) -> None:
+        # Give mDNS a few chances to deliver the remaining records. Stop as
+        # soon as another callback has already resolved this peer.
+        for _ in range(3):
+            time.sleep(0.5)
+            with self._lock:
+                if name in self._peers:
+                    return
             try:
-                props = info.properties or {}
-                raw = props.get(b"name")
-                if raw:
-                    txt_name = raw.decode("utf-8", errors="replace")
-            except Exception:
-                txt_name = None
-            display = txt_name or name.split("." + SERVICE_TYPE[:-1].lstrip("_"))[0].rstrip(".")
+                info = zc.get_service_info(type_, name, timeout=2500)
+            except Exception as e:
+                log.debug(f"Retry resolving service {name}: {e}")
+                continue
+            if info:
+                self._store_info(info, name)
+                return
+
+    def _store_info(self, info, name: str) -> None:
+        """Store a resolved service in both the live list and session history."""
+        try:
+            addrs = info.parsed_addresses(IPVersion.V4Only) or []
+            if not addrs or name == self._get_self():
+                return
+            props = info.properties or {}
+            raw = props.get(b"name")
+            txt_name = raw.decode("utf-8", errors="replace") if raw else None
+            display = txt_name or (
+                name[:-len(SERVICE_TYPE)].rstrip(".")
+                if name.endswith(SERVICE_TYPE) else name.rstrip(".")
+            )
             peer = Peer(name=display, service=name, address=addrs[0], port=info.port or 0, last_seen=time.time())
             with self._lock:
                 self._peers[name] = peer
