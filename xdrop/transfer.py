@@ -32,7 +32,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .crypto import SecureChannel, handshake
 from .logger import get_logger
@@ -45,6 +45,8 @@ DATA_TIMEOUT = 300.0        # seconds allowed for the full data transfer (5 min)
 SENDER_NAME_MAX = 128       # cap peer-supplied sender name to prevent DoS
 MAX_CONCURRENT_SESSIONS = 4 # maximum simultaneous incoming transfers
 MAX_HISTORY = 100           # maximum retained transfers in memory
+MAX_EVENTS_PER_TRANSFER = 200  # cap per-transfer event log to bound memory
+PROGRESS_EVENT_INTERVAL_S = 3.0  # minimum seconds between progress events
 
 
 def probe_peer(address: str, port: int, timeout: float = 5.0) -> float:
@@ -171,6 +173,22 @@ STATUS_FAILED = "failed"
 STATUS_CANCELLED = "cancelled"
 
 
+@dataclass
+class TransferEvent:
+    """A single timestamped application-level event for a transfer.
+
+    These are application-layer observations (offer, decision, chunk milestones,
+    integrity result, etc.) — NOT raw TCP/IP packets.
+    """
+    timestamp: float
+    category: str   # e.g. "connection", "handshake", "offer", "decision",
+                    # "data", "progress", "integrity", "done", "error"
+    details: str    # human-readable description
+
+    def as_dict(self) -> dict:
+        return {"timestamp": self.timestamp, "category": self.category, "details": self.details}
+
+
 class IncomingTransfer:
     """Represents an incoming transfer with thread-safe property access."""
 
@@ -183,6 +201,8 @@ class IncomingTransfer:
         size: int,
         started_at: float,
         resume_offset: int = 0,
+        peer_port: Optional[int] = None,
+        local_port: Optional[int] = None,
     ):
         self.id = id
         self.sender_name = sender_name
@@ -191,6 +211,13 @@ class IncomingTransfer:
         self.size = size
         self.started_at = started_at
         self.resume_offset = resume_offset
+        # Network endpoint metadata
+        self.peer_port: Optional[int] = peer_port       # sender's ephemeral TCP port
+        self.local_port: Optional[int] = local_port     # our listening TCP port
+        self.finished_sha256: Optional[str] = None      # SHA-256 computed by receiver
+        # Transfer event log (application-level, not raw TCP packets)
+        self._events: List[TransferEvent] = []
+        self._last_progress_event: float = 0.0
         self.data_started_at: Optional[float] = None
         self.duration_s: Optional[float] = None
         self._status = STATUS_PENDING
@@ -284,6 +311,37 @@ class IncomingTransfer:
             elapsed = max(end - self.data_started_at, 1e-6)
             return max(0, self._received - self.resume_offset) / elapsed
 
+    def add_event(self, category: str, details: str) -> None:
+        """Append a timestamped event to this transfer's event log (thread-safe).
+
+        Caps storage at MAX_EVENTS_PER_TRANSFER to prevent unbounded memory use.
+        """
+        with self._lock:
+            if len(self._events) >= MAX_EVENTS_PER_TRANSFER:
+                return
+            self._events.append(TransferEvent(
+                timestamp=time.time(),
+                category=category,
+                details=details,
+            ))
+
+    def events_snapshot(self, offset: int = 0, limit: int = 100) -> Tuple[List[dict], int]:
+        """Return a page of events and the total count (thread-safe)."""
+        with self._lock:
+            total = len(self._events)
+            page = [e.as_dict() for e in self._events[offset: offset + limit]]
+        return page, total
+
+    def _maybe_add_progress_event(self, received: int) -> None:
+        """Add a progress event at most once per PROGRESS_EVENT_INTERVAL_S."""
+        now = time.time()
+        with self._lock:
+            if now - self._last_progress_event < PROGRESS_EVENT_INTERVAL_S:
+                return
+            self._last_progress_event = now
+        pct = round(received / self.size * 100, 1) if self.size else 0
+        self.add_event("progress", f"{human_size(received)} of {human_size(self.size)} ({pct}%) received")
+
 
 # ---------------------------------------------------------------------------
 # Sender
@@ -298,10 +356,15 @@ def send_file(
     cancel_event: Optional[threading.Event] = None,
     display_filename: Optional[str] = None,
     frame_observer: Optional[Callable[[dict], None]] = None,
+    event_log: Optional[List[TransferEvent]] = None,
 ) -> dict:
     """Send `filepath` to peer. Blocking. Returns a result dict.
 
-    Result keys: ok (bool), reason (str), bytes_sent (int), sha256 (str, on success).
+    Result keys: ok (bool), reason (str), bytes_sent (int), sha256 (str, on success),
+                 src_port (int), dst_port (int).
+
+    ``event_log`` is an optional list that will be appended with ``TransferEvent``
+    objects (application-level events only — not raw TCP packets).
     """
     filepath = Path(filepath)
     if not filepath.is_file():
@@ -325,20 +388,35 @@ def send_file(
         return {"ok": False, "reason": f"could not read file: {e}", "bytes_sent": 0}
     transfer_id = _resume_id(filename, size, file_digest)
     sent = 0
+    src_port = 0
+
+    def _log_event(category: str, details: str) -> None:
+        if event_log is None:
+            return
+        try:
+            event_log.append(TransferEvent(timestamp=time.time(), category=category, details=details))
+            # Trim to cap — keep only last MAX_EVENTS_PER_TRANSFER entries
+            if len(event_log) > MAX_EVENTS_PER_TRANSFER:
+                del event_log[:-MAX_EVENTS_PER_TRANSFER]
+        except Exception:
+            pass
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(10.0)
     try:
         sock.connect((peer_addr, peer_port))
+        src_port = sock.getsockname()[1]
+        _log_event("connection", f"TCP connection established from local port {src_port} to {peer_addr}:{peer_port}")
     except Exception as e:
         sock.close()
         log.warning(f"Connect to {peer_addr}:{peer_port} failed: {e}")
-        return {"ok": False, "reason": f"connect failed: {e}", "bytes_sent": 0}
+        return {"ok": False, "reason": f"connect failed: {e}", "bytes_sent": 0, "src_port": 0, "dst_port": peer_port}
 
     ch: Optional[SecureChannel] = None
     try:
         sock.settimeout(30.0)
         ch = handshake(sock, frame_observer=frame_observer)
+        _log_event("handshake", "X25519 key exchange and HKDF-SHA256 derivation complete; AES-256-GCM channel established")
         _send_json(ch, {
             "type": "offer",
             "sender": sender_name[:SENDER_NAME_MAX],
@@ -347,6 +425,7 @@ def send_file(
             "sha256": file_digest,
             "transfer_id": transfer_id,
         })
+        _log_event("offer", f"Offer sent: '{filename}' ({human_size(size)}) SHA-256 {file_digest[:12]}…")
         log.info(f"Offered {filename} ({size} bytes) to {peer_addr}:{peer_port}")
 
         # Wait for receiver decision
@@ -354,14 +433,22 @@ def send_file(
         resp = _recv_json(ch)
         if resp.get("type") != "response" or not resp.get("accept"):
             reason = resp.get("reason") or "rejected by peer"
+            _log_event("decision", f"Offer rejected by receiver: {reason}")
             log.info(f"Offer for {filename} rejected by peer: {reason}")
             return {
                 "ok": False,
                 "reason": reason,
                 "bytes_sent": 0,
+                "src_port": src_port,
+                "dst_port": peer_port,
             }
 
         # Data transfer phase
+        offset_val = int(resp.get("offset", 0))
+        if offset_val > 0:
+            _log_event("decision", f"Offer accepted; receiver requests resume from offset {human_size(offset_val)}")
+        else:
+            _log_event("decision", "Offer accepted by receiver; starting data transfer")
         sock.settimeout(DATA_TIMEOUT)
         hasher = hashlib.sha256()
         with filepath.open("rb") as f:
@@ -385,6 +472,8 @@ def send_file(
                     progress(sent, size)
                 except Exception:
                     pass
+            _log_event("data", f"Sending file data: {human_size(size)} total, {CHUNK_SIZE // 1024} KiB chunks, AES-256-GCM encrypted")
+            _last_progress = time.time()
             while sent < size:
                 if cancel_event and cancel_event.is_set():
                     log.info(f"Send of {filepath.name} cancelled by user")
@@ -392,6 +481,8 @@ def send_file(
                         "ok": False,
                         "reason": "transfer cancelled by user",
                         "bytes_sent": sent,
+                        "src_port": src_port,
+                        "dst_port": peer_port,
                     }
 
                 chunk = f.read(CHUNK_SIZE)
@@ -400,6 +491,11 @@ def send_file(
                 ch.send(chunk, record_type="file_chunk")
                 hasher.update(chunk)
                 sent += len(chunk)
+                now = time.time()
+                if now - _last_progress >= PROGRESS_EVENT_INTERVAL_S:
+                    _last_progress = now
+                    pct = round(sent / size * 100, 1) if size else 0
+                    _log_event("progress", f"{human_size(sent)} of {human_size(size)} ({pct}%) sent")
                 if progress:
                     try:
                         progress(sent, size)
@@ -408,9 +504,11 @@ def send_file(
 
         if hasher.hexdigest() != file_digest:
             _send_json(ch, {"type": "done", "sha256": hasher.hexdigest()})
-            return {"ok": False, "reason": "file changed during transfer", "bytes_sent": sent}
+            return {"ok": False, "reason": "file changed during transfer", "bytes_sent": sent,
+                    "src_port": src_port, "dst_port": peer_port}
 
         _send_json(ch, {"type": "done", "sha256": hasher.hexdigest()})
+        _log_event("done", f"All {human_size(sent)} sent; SHA-256 {hasher.hexdigest()[:12]}… sent to receiver for verification")
         log.info(f"Sent all {sent} bytes of {filename}, awaiting acknowledgement")
 
         # Best-effort wait for receiver's ack
@@ -419,20 +517,28 @@ def send_file(
             ack = _recv_json(ch)
             if ack.get("type") == "ack" and ack.get("ok") is False:
                 reason = ack.get("reason") or "receiver verification failed"
+                _log_event("integrity", f"Receiver SHA-256 verification FAILED: {reason}")
                 log.warning(f"Receiver failed verification for {filename}: {reason}")
                 return {
                     "ok": False,
                     "reason": reason,
                     "bytes_sent": sent,
+                    "src_port": src_port,
+                    "dst_port": peer_port,
                 }
+            _log_event("integrity", "Receiver SHA-256 verification passed; transfer complete")
         except Exception as e:
             log.warning(f"Timed out or failed awaiting ack: {e}")
+            _log_event("integrity", f"No acknowledgement received from receiver ({e}); assuming success")
 
         log.info(f"Successfully transferred {filename} ({sent} bytes)")
-        return {"ok": True, "reason": "", "bytes_sent": sent, "sha256": hasher.hexdigest(), "transfer_id": transfer_id}
+        return {"ok": True, "reason": "", "bytes_sent": sent, "sha256": hasher.hexdigest(),
+                "transfer_id": transfer_id, "src_port": src_port, "dst_port": peer_port}
     except Exception as e:
+        _log_event("error", f"Transfer error: {e}")
         log.error(f"Transfer error for {filename}: {e}")
-        return {"ok": False, "reason": f"transfer error: {e}", "bytes_sent": sent}
+        return {"ok": False, "reason": f"transfer error: {e}", "bytes_sent": sent,
+                "src_port": src_port, "dst_port": peer_port}
     finally:
         try:
             sock.close()
@@ -630,6 +736,8 @@ class ReceiverServer:
                     part_path.unlink(missing_ok=True)
                     meta_path.unlink(missing_ok=True)
 
+            # Parse peer port from addr tuple
+            _peer_ip, _peer_port = addr[0], addr[1]
             t = IncomingTransfer(
                 id=uuid.uuid4().hex[:8],
                 sender_name=sender_name,
@@ -638,8 +746,13 @@ class ReceiverServer:
                 size=size,
                 started_at=time.time(),
                 resume_offset=resume_offset,
+                peer_port=_peer_port,
+                local_port=self.port,
             )
             t.received = resume_offset
+            t.add_event("connection", f"TCP connection accepted from {sender_addr} (peer port {_peer_port}); local port {self.port}")
+            t.add_event("handshake", "X25519 key exchange and HKDF-SHA256 complete; AES-256-GCM channel established")
+            t.add_event("offer", f"Offer received: '{filename}' {human_size(size)} SHA-256 {offered_digest[:12] if offered_digest else '(none)'}…{' [resumable]' if resumable else ''}")
 
             # Pre-flight storage check
             if not check_disk_space(dest_dir, size - resume_offset):
@@ -673,6 +786,7 @@ class ReceiverServer:
                 t.status = STATUS_REJECTED
                 t.error = "timed out waiting for user decision"
                 t.finished_at = time.time()
+                t.add_event("decision", "Transfer offer timed out waiting for user decision")
                 log.info(f"Transfer {t.id} timed out waiting for decision")
                 try:
                     _send_json(ch, {"type": "response", "accept": False, "reason": "timeout"})
@@ -685,6 +799,7 @@ class ReceiverServer:
             if not t._accepted:
                 t.status = STATUS_REJECTED
                 t.finished_at = time.time()
+                t.add_event("decision", "Transfer rejected by local user")
                 log.info(f"Transfer {t.id} rejected by user")
                 try:
                     _send_json(ch, {"type": "response", "accept": False, "reason": "rejected"})
@@ -699,6 +814,11 @@ class ReceiverServer:
             t.temp_path = temp_path
             t.status = STATUS_ACTIVE
             t.data_started_at = time.time()
+            if resume_offset > 0:
+                t.add_event("decision", f"Accepted with resume from offset {human_size(resume_offset)}; sent response to sender")
+            else:
+                t.add_event("decision", "Accepted by local user; sent acceptance response to sender")
+            t.add_event("data", f"Receiving file data: {human_size(size)} total, AES-256-GCM encrypted")
             if self.on_update:
                 self.on_update(t)
             if resumable and meta_path:
@@ -729,6 +849,7 @@ class ReceiverServer:
                     hasher.update(frame)
                     received += len(frame)
                     t.received = received
+                    t._maybe_add_progress_event(received)
                     if self.on_update:
                         self.on_update(t)
 
@@ -743,15 +864,18 @@ class ReceiverServer:
                 log.warning(f"Error receiving done frame for {t.id}: {e}")
 
             actual_sha = hasher.hexdigest()
+            t.finished_sha256 = actual_sha  # Store computed digest regardless of outcome
             if received < size:
                 t.status = STATUS_FAILED
                 t.error = f"truncated: got {received}/{size} bytes"
+                t.add_event("error", f"Transfer truncated: received {human_size(received)} of {human_size(size)}")
                 log.error(f"Transfer {t.id} truncated: {received}/{size} bytes")
             elif (integrity_error := _integrity_failure(
                 actual_sha, expected_sha, offered_digest if resumable else None
             )):
                 t.status = STATUS_FAILED
                 t.error = integrity_error
+                t.add_event("integrity", f"SHA-256 verification FAILED: computed {actual_sha[:12]}… expected {(expected_sha or 'missing')[:12]}…")
                 log.error(f"Transfer {t.id} {integrity_error} (expected {expected_sha}, computed {actual_sha})")
                 try:
                     _send_json(ch, {"type": "ack", "ok": False, "reason": t.error})
@@ -767,6 +891,7 @@ class ReceiverServer:
                 t.save_path = final_path
                 t.status = STATUS_DONE
                 t.verified = True
+                t.add_event("integrity", f"SHA-256 verification passed: {actual_sha[:12]}… File saved to {final_path.name}")
                 log.info(f"Transfer {t.id} verified and saved to {final_path}")
                 try:
                     _send_json(ch, {"type": "ack", "ok": True})
@@ -776,11 +901,13 @@ class ReceiverServer:
             t.finished_at = time.time()
             if t.data_started_at:
                 t.duration_s = max(0.0, t.finished_at - t.data_started_at)
+            t.add_event("done", f"Transfer session ended: status={t.status}")
             if self.on_update:
                 self.on_update(t)
         except Exception as e:
             log.error(f"Error handling session for {sender_addr}: {e}")
             if t is not None:
+                t.add_event("error", f"Session error: {e}")
                 t.status = STATUS_FAILED
                 t.error = str(e)
                 t.finished_at = time.time()

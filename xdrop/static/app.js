@@ -14,6 +14,14 @@ let routePanelMode = 'trace';
 let routeStep = -1;
 let routeZoom = 1;
 let routeReplayTimer = null;
+// Analyzer modal state
+let analyzerTransferId = null;
+let analyzerTab = 'overview';
+let analyzerData = null;
+let analyzerRefreshTimer = null;
+let analyzerEventOffset = 0;
+let analyzerEventSearch = '';
+let analyzerEventCategory = '';
 
 const escapeHTML = (value = '') => String(value).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 const size = bytes => {
@@ -51,7 +59,11 @@ function deviceRow(peer, compact = false) {
 function incomingCard(item) {
   const pending = item.status === 'pending';
   const status = `${item.status === 'active' ? `${size(item.received)} of ${size(item.size)} received` : `${item.status}${item.verified ? ' · SHA-256 verified' : ''}`}${Number(item.resumed_bytes) > 0 ? ` · resumed ${size(item.resumed_bytes)}` : ''}`;
-  return `<div class="incoming-card"><div class="device-avatar">↓</div><div class="incoming-info"><strong>${escapeHTML(item.filename)}</strong><span>${escapeHTML(item.sender)} · ${size(item.size)} · ${escapeHTML(item.address || '')}</span><span class="status-text ${item.status === 'failed' ? 'failed' : item.status === 'done' ? 'done' : ''}">${escapeHTML(status)}</span></div>${pending ? `<div class="incoming-actions"><button class="button button-secondary" data-decision="accept" data-id="${escapeHTML(item.id)}">Accept</button><button class="button button-quiet" data-decision="reject" data-id="${escapeHTML(item.id)}">Decline</button></div>` : ''}</div>`;
+  const analyzable = !pending;
+  const analyzeAttr = analyzable ? ` data-analyze-id="${escapeHTML(item.id)}" data-analyze-dir="incoming"` : '';
+  const badge = analyzable ? `<span class="analyze-badge">Inspect ⊙</span>` : '';
+  return `<div class="incoming-card"${analyzeAttr}><div class="device-avatar">↓</div><div class="incoming-info"><strong>${escapeHTML(item.filename)}</strong><span>${escapeHTML(item.sender)} · ${size(item.size)} · ${escapeHTML(item.address || '')}</span><span class="status-text ${item.status === 'failed' ? 'failed' : item.status === 'done' ? 'done' : ''}">` +
+  `${escapeHTML(status)}</span></div>${pending ? `<div class="incoming-actions"><button class="button button-secondary" data-decision="accept" data-id="${escapeHTML(item.id)}">Accept</button><button class="button button-quiet" data-decision="reject" data-id="${escapeHTML(item.id)}">Decline</button></div>` : badge}</div>`;
 }
 function transferCard(item, direction) {
   const sent = Number(item.sent || item.received || 0);
@@ -64,7 +76,9 @@ function transferCard(item, direction) {
   const mark = item.status === 'done' ? '✓' : item.status === 'failed' ? '!' : item.status === 'cancelled' ? '×' : '⇅';
   const details = [Number(item.resumed_bytes) > 0 ? `resumed ${size(item.resumed_bytes)}` : '', item.status === 'done' && Number(item.throughput_bps) > 0 ? `${size(item.throughput_bps)}/s avg` : '', item.verified ? 'SHA-256 verified' : ''].filter(Boolean).join(' · ');
   const routeAction = direction === 'out' && item.status === 'done' ? `<button class="button button-secondary button-small" data-route-trace="${escapeHTML(`${item.peer}:${item.port}`)}" data-transfer-id="${escapeHTML(item.id)}">Trace route</button>` : '';
-  return `<div class="file-card"><div class="file-icon">${mark}</div><div class="file-meta"><strong>${escapeHTML(item.filename)}</strong><span>${direction === 'out' ? `To ${escapeHTML(item.peer)}` : `From ${escapeHTML(item.sender)}`} · ${size(total)}${details ? ` · ${escapeHTML(details)}` : ''}${item.error ? ` · ${escapeHTML(item.error)}` : ''}</span>${!done ? `<div class="progress-wrap"><i style="width:${percent}%"></i></div>` : ''}</div><div class="transfer-status">${escapeHTML(status)}</div>${item.can_cancel ? `<button class="button button-danger button-small" data-cancel-transfer="${escapeHTML(item.id)}">Cancel</button>` : ''}${direction === 'out' && item.can_resume ? `<button class="button button-secondary button-small" data-resume-transfer="${escapeHTML(item.id)}">Resume</button>` : ''}${routeAction}</div>`;
+  const analyzeAttr = ` data-analyze-id="${escapeHTML(item.id)}" data-analyze-dir="outgoing"`;
+  const analyzeBadge = `<span class="analyze-badge">Inspect ⊙</span>`;
+  return `<div class="file-card"${analyzeAttr}><div class="file-icon">${mark}</div><div class="file-meta"><strong>${escapeHTML(item.filename)}</strong><span>${direction === 'out' ? `To ${escapeHTML(item.peer)}` : `From ${escapeHTML(item.sender)}`} · ${size(total)}${details ? ` · ${escapeHTML(details)}` : ''}${item.error ? ` · ${escapeHTML(item.error)}` : ''}</span>${!done ? `<div class="progress-wrap"><i style="width:${percent}%"></i></div>` : ''}</div><div class="transfer-status">${escapeHTML(status)}</div>${item.can_cancel ? `<button class="button button-danger button-small" data-cancel-transfer="${escapeHTML(item.id)}">Cancel</button>` : ''}${direction === 'out' && item.can_resume ? `<button class="button button-secondary button-small" data-resume-transfer="${escapeHTML(item.id)}">Resume</button>` : ''}${routeAction}${analyzeBadge}</div>`;
 }
 function protocolAnalysisMarkup(trace) {
   const analysis = trace.protocol_analysis || {};
@@ -162,6 +176,254 @@ function stopRouteReplay() {
   clearInterval(routeReplayTimer);
   routeReplayTimer = null;
 }
+
+// ============================================================
+// Transfer Analyzer Modal
+// ============================================================
+function closeAnalyzer() {
+  clearInterval(analyzerRefreshTimer);
+  analyzerRefreshTimer = null;
+  analyzerTransferId = null;
+  analyzerData = null;
+  analyzerTab = 'overview';
+  analyzerEventOffset = 0;
+  analyzerEventSearch = '';
+  analyzerEventCategory = '';
+  document.querySelector('#analyzer-modal').hidden = true;
+}
+function analyzerCatClass(cat) {
+  const map = {connection:'az-cat-connection',handshake:'az-cat-handshake',offer:'az-cat-offer',decision:'az-cat-decision',data:'az-cat-data',progress:'az-cat-progress',integrity:'az-cat-integrity',done:'az-cat-done',error:'az-cat-error'};
+  return map[cat] || 'az-cat-data';
+}
+function fmtTime(stamp) {
+  if (!stamp) return '—';
+  const d = new Date(stamp * 1000);
+  return d.toLocaleTimeString(undefined, {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+}
+function fmtDuration(s) {
+  if (!Number.isFinite(Number(s)) || s <= 0) return '—';
+  if (s < 60) return `${Number(s).toFixed(2)} s`;
+  return `${Math.floor(s/60)}m ${Math.round(s%60)}s`;
+}
+function renderAnalyzerModal() {
+  const panel = document.querySelector('#analyzer-panel');
+  if (!analyzerData || !analyzerTransferId) { panel.innerHTML = '<div class="analyzer-loading"><div class="spinner"></div><span>Loading…</span></div>'; return; }
+  const d = analyzerData;
+  const ov = d.overview || {};
+  const dirLabel = d.direction === 'incoming' ? '↓ Incoming' : '↑ Outgoing';
+  const tabs = ['overview','events','protocol','route','diagnostics'];
+  const tabLabels = {overview:'Overview',events:'Events',protocol:'Protocol Stack',route:'Route',diagnostics:'Diagnostics'};
+  const tabsHTML = tabs.map(tab => `<button class="az-tab${analyzerTab===tab?' active':''}" data-az-tab="${tab}">${tabLabels[tab]}</button>`).join('');
+
+  // --- OVERVIEW ---
+  const bytes = ov.direction === 'receive' ? (ov.bytes_received || 0) : (ov.bytes_sent || 0);
+  const throughput = Number(ov.throughput_bps || 0);
+  const chunks = ov.chunks_received ?? ov.chunks_sent ?? '—';
+  const statusClass = ov.status === 'done' ? 'az-good' : (ov.status === 'failed' || ov.status === 'rejected') ? 'az-bad' : '';
+  const verifiedHTML = ov.verified ? `<span class="az-good">✓ SHA-256 verified</span>` : (ov.sha256 ? '<span class="az-bad">✗ Not verified</span>' : '<span>—</span>');
+  const sha256Short = ov.sha256 ? `<span class="az-mono">${ov.sha256.slice(0,16)}…</span>` : '<span>—</span>';
+  const overviewHTML = `
+    <div class="az-stat-row">
+      <div class="az-stat"><span>File size</span><strong>${size(ov.size || 0)}</strong><small>${(ov.size||0).toLocaleString()} bytes</small></div>
+      <div class="az-stat"><span>Throughput</span><strong>${throughput > 0 ? size(throughput)+'/s' : '—'}</strong><small>${fmtDuration(ov.duration_s)} transfer</small></div>
+      <div class="az-stat"><span>Chunks</span><strong>${chunks}</strong><small>64 KiB chunks</small></div>
+    </div>
+    <div class="az-overview-grid">
+      <div class="az-overview-card">
+        <h3>Transfer identity</h3>
+        <div class="az-kv">
+          <div class="az-kv-row"><span>Filename</span><strong>${escapeHTML(ov.filename || '—')}</strong></div>
+          <div class="az-kv-row"><span>Status</span><strong class="${statusClass}">${escapeHTML(ov.status || '—')}</strong></div>
+          <div class="az-kv-row"><span>Direction</span><strong>${escapeHTML(ov.direction || '—')}</strong></div>
+          <div class="az-kv-row"><span>Transfer ID</span><strong class="az-mono">${escapeHTML(analyzerTransferId)}</strong></div>
+          <div class="az-kv-row"><span>Integrity</span><div>${verifiedHTML}</div></div>
+          <div class="az-kv-row"><span>SHA-256</span><div>${sha256Short}</div></div>
+          ${Number(ov.resume_offset) > 0 ? `<div class="az-kv-row"><span>Resumed from</span><strong>${size(ov.resume_offset)}</strong></div>` : ''}
+          ${ov.error ? `<div class="az-kv-row"><span>Error</span><strong class="az-bad">${escapeHTML(ov.error)}</strong></div>` : ''}
+        </div>
+      </div>
+      <div class="az-overview-card">
+        <h3>Network endpoints</h3>
+        <div class="az-kv">
+          <div class="az-kv-row"><span>Sender</span><strong>${escapeHTML(ov.sender || '—')}</strong></div>
+          <div class="az-kv-row"><span>Receiver</span><strong>${escapeHTML(ov.receiver || '—')}</strong></div>
+          <div class="az-kv-row"><span>Sender IP</span><strong class="az-mono">${escapeHTML(ov.sender_ip || '—')}</strong></div>
+          <div class="az-kv-row"><span>Receiver IP</span><strong class="az-mono">${escapeHTML(ov.receiver_ip || '—')}</strong></div>
+          <div class="az-kv-row"><span>Sender port</span><strong class="az-mono">${ov.sender_port || '—'}</strong></div>
+          <div class="az-kv-row"><span>Receiver port</span><strong class="az-mono">${ov.receiver_port || '—'}</strong></div>
+          <div class="az-kv-row"><span>Started</span><strong>${fmtTime(ov.started_at)}</strong></div>
+          <div class="az-kv-row"><span>Finished</span><strong>${fmtTime(ov.finished_at)}</strong></div>
+          <div class="az-kv-row"><span>Duration</span><strong>${fmtDuration(ov.duration_s)}</strong></div>
+        </div>
+      </div>
+    </div>`;
+
+  // --- EVENTS ---
+  const allEvents = d.events || [];
+  const filteredEvents = allEvents.filter(ev => {
+    const matchSearch = !analyzerEventSearch || ev.details.toLowerCase().includes(analyzerEventSearch.toLowerCase()) || ev.category.includes(analyzerEventSearch.toLowerCase());
+    const matchCat = !analyzerEventCategory || ev.category === analyzerEventCategory;
+    return matchSearch && matchCat;
+  });
+  const totalEvents = d.events_total || 0;
+  const pageSize = 25;
+  const maxPage = Math.max(0, Math.ceil(filteredEvents.length / pageSize) - 1);
+  const pageEvents = filteredEvents.slice(analyzerEventOffset, analyzerEventOffset + pageSize);
+  const eventRows = pageEvents.length ? pageEvents.map(ev => {
+    const ts = ev.timestamp ? new Date(ev.timestamp*1000).toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '—';
+    return `<div class="az-event-row"><span>${ts}</span><div><span class="az-event-cat ${analyzerCatClass(ev.category)}">${escapeHTML(ev.category)}</span></div><div class="az-event-detail">${escapeHTML(ev.details)}</div></div>`;
+  }).join('') : `<div class="az-empty">No events match your filter.</div>`;
+  const cats = [...new Set(allEvents.map(e => e.category))].sort();
+  const catOptions = `<option value="">All categories</option>` + cats.map(c => `<option value="${escapeHTML(c)}" ${analyzerEventCategory===c?'selected':''}>${escapeHTML(c)}</option>`).join('');
+  const eventsHTML = `
+    <div class="az-toolbar">
+      <input class="az-search" id="az-event-search" type="search" placeholder="Search events…" value="${escapeHTML(analyzerEventSearch)}">
+      <select class="az-filter-select" id="az-event-cat">${catOptions}</select>
+    </div>
+    <div class="az-event-table">
+      <div class="az-event-head"><span>Time</span><span>Category</span><span>Details</span></div>
+      ${eventRows}
+    </div>
+    <div class="az-pagination">
+      <button id="az-prev-page" ${analyzerEventOffset === 0 ? 'disabled' : ''}>← Prev</button>
+      <span>Showing ${Math.min(filteredEvents.length, analyzerEventOffset + pageSize)} of ${filteredEvents.length} filtered · ${totalEvents} total events</span>
+      <button id="az-next-page" ${analyzerEventOffset >= maxPage * pageSize ? 'disabled' : ''}>Next →</button>
+    </div>`;
+
+  // --- PROTOCOL STACK ---
+  const stack = d.protocol_stack || [];
+  const stackHTML = stack.length ? `<div class="az-stack">
+    ${stack.map((layer, index) => `
+      <div class="az-stack-layer">
+        <div class="az-stack-num">${index + 1}</div>
+        <div class="az-stack-layer-name">${escapeHTML(layer.layer)}</div>
+        <div><div class="az-stack-proto">${escapeHTML(layer.protocol)}</div><div class="az-stack-detail">${escapeHTML(layer.detail)}</div></div>
+        <span class="az-stack-obs ${layer.observed ? 'yes' : 'inferred'}">${layer.observed ? '✓ Observed' : '~ Inferred'}</span>
+      </div>`).join('')}
+    </div>
+    <div class="az-empty" style="margin-top:14px;font-size:9px;color:#7a7f88">
+      Application-level observations only. TCP segment boundaries, IP headers, retransmissions, and link-layer frames are managed by the OS and are not captured by xdrop. No raw packet capture is performed.
+    </div>` : `<div class="az-empty">Protocol stack information is not available for this transfer.</div>`;
+
+  // --- ROUTE tab (launches existing route modal) ---
+  const netInfo = d.network || {};
+  const peerEndpoint = d.direction === 'incoming'
+    ? `${netInfo.remote_ip || ''}:${netInfo.remote_port || 0}`
+    : `${netInfo.remote_ip || ''}:${netInfo.remote_port || 0}`;
+  const routeHTML = `
+    <div class="az-route-note">Click the button below to run a separate traceroute to this peer. The traceroute is a new probe — it does not replay the file transfer. Firewalls and routers may block some or all hops.</div>
+    <button class="az-route-btn" data-route-trace="${escapeHTML(peerEndpoint)}" data-transfer-id="${escapeHTML(analyzerTransferId)}">⌁ Trace route to peer (${escapeHTML(netInfo.remote_ip || 'unknown')})</button>
+    ${netInfo.remote_ip ? `
+    <div class="az-kv" style="margin-top:8px">
+      <div class="az-kv-row"><span>Local IP</span><strong class="az-mono">${escapeHTML(netInfo.local_ip || '—')}</strong></div>
+      <div class="az-kv-row"><span>Remote IP</span><strong class="az-mono">${escapeHTML(netInfo.remote_ip || '—')}</strong></div>
+      <div class="az-kv-row"><span>Same /24 subnet</span><strong>${netInfo.same_subnet === true ? '<span class="az-good">Yes</span>' : netInfo.same_subnet === false ? '<span class="az-bad">No</span>' : '—'}</strong></div>
+    </div>` : ''}`;
+
+  // --- DIAGNOSTICS ---
+  const diagHTML = `
+    <div class="az-net-grid">
+      <div class="az-net-card">
+        <h3>Network addresses</h3>
+        <div class="az-kv">
+          <div class="az-kv-row"><span>This device IP</span><strong class="az-mono">${escapeHTML(netInfo.local_ip || '—')}</strong></div>
+          <div class="az-kv-row"><span>Peer IP</span><strong class="az-mono">${escapeHTML(netInfo.remote_ip || '—')}</strong></div>
+          <div class="az-kv-row"><span>Local port</span><strong class="az-mono">${netInfo.local_port || '—'}</strong></div>
+          <div class="az-kv-row"><span>Remote port</span><strong class="az-mono">${netInfo.remote_port || '—'}</strong></div>
+        </div>
+      </div>
+      <div class="az-net-card">
+        <h3>Topology estimate</h3>
+        <div class="az-kv">
+          <div class="az-kv-row"><span>Same /24 subnet</span><strong>${netInfo.same_subnet === true ? '<span class="az-good">✓ Yes (local)</span>' : netInfo.same_subnet === false ? '<span class="az-bad">No (routed)</span>' : '<span>Unavailable</span>'}</strong></div>
+          <div class="az-kv-row"><span>Note</span><strong>IP headers and routing are OS-managed; only application-layer data is observed by xdrop.</strong></div>
+        </div>
+        ${netInfo.remote_ip ? `<button class="az-net-diag-btn" id="az-run-diag" data-diag-endpoint="${escapeHTML(`${netInfo.remote_ip}:${netInfo.remote_port || 0}`)}">▶ Run connection probe</button>` : ''}
+        <div id="az-diag-result"></div>
+      </div>
+    </div>`;
+
+  // Build section content
+  const sections = {overview:overviewHTML, events:eventsHTML, protocol:stackHTML, route:routeHTML, diagnostics:diagHTML};
+  panel.innerHTML = `
+    <div class="az-header">
+      <div class="az-header-left">
+        <span class="az-badge ${d.direction === 'incoming' ? 'in' : ''}">${dirLabel}</span>
+        <div><div class="az-title" id="analyzer-title">${escapeHTML(ov.filename || analyzerTransferId)}</div><div class="az-subtitle">Transfer · ${escapeHTML(ov.status || '')} · ${size(ov.size || 0)}</div></div>
+      </div>
+      <button class="az-close" id="az-close-btn" aria-label="Close analyzer">×</button>
+    </div>
+    <div class="az-tabs">${tabsHTML}</div>
+    <div class="az-body">
+      ${tabs.map(tab => `<div class="az-section${analyzerTab===tab?' visible':''}" id="az-section-${tab}">${sections[tab]}</div>`).join('')}
+    </div>`;
+
+  // Wire up in-modal events
+  document.querySelector('#az-close-btn').addEventListener('click', closeAnalyzer);
+  panel.querySelectorAll('.az-tab').forEach(btn => btn.addEventListener('click', () => {
+    analyzerTab = btn.dataset.azTab;
+    panel.querySelectorAll('.az-tab').forEach(t => t.classList.toggle('active', t.dataset.azTab === analyzerTab));
+    panel.querySelectorAll('.az-section').forEach(s => s.classList.toggle('visible', s.id === `az-section-${analyzerTab}`));
+  }));
+  const searchInput = panel.querySelector('#az-event-search');
+  if (searchInput) searchInput.addEventListener('input', () => { analyzerEventSearch = searchInput.value; analyzerEventOffset = 0; renderAnalyzerModal(); });
+  const catSelect = panel.querySelector('#az-event-cat');
+  if (catSelect) catSelect.addEventListener('change', () => { analyzerEventCategory = catSelect.value; analyzerEventOffset = 0; renderAnalyzerModal(); });
+  const prevBtn = panel.querySelector('#az-prev-page');
+  if (prevBtn) prevBtn.addEventListener('click', () => { analyzerEventOffset = Math.max(0, analyzerEventOffset - pageSize); renderAnalyzerModal(); });
+  const nextBtn = panel.querySelector('#az-next-page');
+  if (nextBtn) nextBtn.addEventListener('click', () => { analyzerEventOffset = Math.min(maxPage * pageSize, analyzerEventOffset + pageSize); renderAnalyzerModal(); });
+  const runDiagBtn = panel.querySelector('#az-run-diag');
+  if (runDiagBtn) runDiagBtn.addEventListener('click', async () => {
+    const ep = runDiagBtn.dataset.diagEndpoint;
+    const resultDiv = panel.querySelector('#az-diag-result');
+    if (!resultDiv) return;
+    resultDiv.innerHTML = '<div class="az-empty">Running probe…</div>';
+    try {
+      const result = await request('/api/network-diag', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({endpoint:ep})});
+      resultDiv.innerHTML = `<div class="az-diag-result">
+        <strong>Local IP:</strong> ${escapeHTML(result.local_ip || '—')}<br>
+        <strong>Remote IP:</strong> ${escapeHTML(result.remote_ip || '—')}<br>
+        <strong>Subnet:</strong> ${escapeHTML(result.same_subnet_note || '—')}<br>
+        <strong>Probe latency:</strong> ${result.probe_ms != null ? `${Number(result.probe_ms).toFixed(1)} ms (connect + handshake + round-trip)` : `Failed: ${escapeHTML(result.probe_error || 'unknown error')}`}<br>
+        <small style="color:#7a7f88">${escapeHTML(result.note || '')}</small>
+      </div>`;
+    } catch (error) { resultDiv.innerHTML = `<div class="az-diag-result az-bad">${escapeHTML(error.message)}</div>`; }
+  });
+}
+async function analyzeTransfer(transferId) {
+  analyzerTransferId = transferId;
+  analyzerData = null;
+  analyzerTab = 'overview';
+  analyzerEventOffset = 0;
+  analyzerEventSearch = '';
+  analyzerEventCategory = '';
+  const modal = document.querySelector('#analyzer-modal');
+  const panel = document.querySelector('#analyzer-panel');
+  modal.hidden = false;
+  panel.innerHTML = '<div class="analyzer-loading"><div class="spinner"></div><span>Loading transfer analysis…</span></div>';
+  try {
+    analyzerData = await request(`/api/analyzer/${encodeURIComponent(transferId)}`);
+    renderAnalyzerModal();
+    clearInterval(analyzerRefreshTimer);
+    const activeStatuses = new Set(['active','sending','connecting','pending']);
+    if (activeStatuses.has(analyzerData?.overview?.status)) {
+      analyzerRefreshTimer = setInterval(async () => {
+        if (document.querySelector('#analyzer-modal')?.hidden) { clearInterval(analyzerRefreshTimer); return; }
+        try {
+          const fresh = await request(`/api/analyzer/${encodeURIComponent(analyzerTransferId)}`);
+          analyzerData = fresh;
+          if (!activeStatuses.has(fresh?.overview?.status)) clearInterval(analyzerRefreshTimer);
+          renderAnalyzerModal();
+        } catch (_) {}
+      }, 2000);
+    }
+  } catch (error) {
+    panel.innerHTML = `<div class="az-header"><button class="az-close" id="az-close-btn">×</button></div><div class="az-body"><div class="az-empty"><strong>Could not load analysis</strong><br>${escapeHTML(error.message)}</div></div>`;
+    document.querySelector('#az-close-btn')?.addEventListener('click', closeAnalyzer);
+  }
+}
+
 function heading(kicker, title, subtitle, action = '') {
   return `<div class="page-heading"><div><div class="eyebrow">${kicker}</div><h1>${title}</h1><p>${subtitle}</p></div>${action}</div>`;
 }
@@ -349,6 +611,14 @@ function switchView(view, peer = '') {
   }
 }
 document.addEventListener('click', async event => {
+  // Analyzer modal: backdrop click
+  if (event.target.id === 'analyzer-modal') { closeAnalyzer(); return; }
+  // Analyzer card click: open modal
+  const analyzeCard = event.target.closest('[data-analyze-id]');
+  if (analyzeCard && !event.target.closest('button') && !event.target.closest('.incoming-actions')) {
+    await analyzeTransfer(analyzeCard.dataset.analyzeId);
+    return;
+  }
   const nav = event.target.closest('[data-view]');
   if (nav) { switchView(nav.dataset.view); return; }
   const action = event.target.closest('[data-action]');
@@ -686,6 +956,7 @@ document.addEventListener('keydown', event => {
     closeQrScanner();
     stopRouteReplay();
     document.querySelector('#route-modal').hidden = true;
+    closeAnalyzer();
   }
 });
 refresh();

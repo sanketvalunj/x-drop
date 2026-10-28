@@ -23,7 +23,10 @@ from .config import Config
 from .crypto import GCM_TAG_LEN, HANDSHAKE_LEN, LEN_LEN, NONCE_LEN
 from .discovery import DiscoveryService, _primary_ipv4, parse_peer_endpoint
 from .logger import init_logging
-from .transfer import CHUNK_SIZE, IncomingTransfer, ReceiverServer, probe_peer, sanitize_filename, send_file
+from .transfer import (
+    CHUNK_SIZE, IncomingTransfer, ReceiverServer, TransferEvent,
+    probe_peer, sanitize_filename, send_file,
+)
 
 try:
     import qrcode
@@ -168,6 +171,88 @@ def _trace_route(target: str) -> dict:
     return {"target": target, "hops": hops, "reached": reached, "error": error, "max_hops": MAX_TRACE_HOPS}
 
 
+def _same_subnet(ip_a: Optional[str], ip_b: Optional[str], prefix: int = 24) -> Optional[bool]:
+    """Best-effort check whether two IPv4 addresses share the same /prefix subnet."""
+    if not ip_a or not ip_b:
+        return None
+    try:
+        import ipaddress as _ipa
+        net_a = _ipa.IPv4Network(f"{ip_a}/{prefix}", strict=False)
+        return _ipa.IPv4Address(ip_b) in net_a
+    except Exception:
+        return None
+
+
+def _build_protocol_stack(
+    sender_ip: Optional[str],
+    receiver_ip: Optional[str],
+    sender_port: Optional[int],
+    receiver_port: Optional[int],
+    direction: str,
+) -> list:
+    """Return the xdrop protocol stack description for a transfer.
+
+    All entries clearly distinguish observed facts from inferred architecture.
+    """
+    src_ep = f"{sender_ip}:{sender_port}" if sender_ip and sender_port else "unknown"
+    dst_ep = f"{receiver_ip}:{receiver_port}" if receiver_ip and receiver_port else "unknown"
+    return [
+        {
+            "layer": "Application",
+            "protocol": "xdrop v1",
+            "observed": True,
+            "detail": (
+                f"Offer → Response → Encrypted file chunks → Done → Ack. "
+                f"Direction: {direction}. "
+                f"Encryption: AES-256-GCM. Key agreement: X25519 + HKDF-SHA256. "
+                f"File integrity: SHA-256. Chunk size: 64 KiB."
+            ),
+        },
+        {
+            "layer": "Transport",
+            "protocol": "TCP",
+            "observed": True,
+            "detail": (
+                f"Reliable ordered byte stream. "
+                f"{'Source' if direction == 'outgoing' else 'Peer'} endpoint: {src_ep}. "
+                f"{'Destination' if direction == 'outgoing' else 'Local'} endpoint: {dst_ep}. "
+                "OS controls segment boundaries, retransmissions, and ACKs transparently."
+            ),
+        },
+        {
+            "layer": "Network",
+            "protocol": "IPv4",
+            "observed": True,
+            "detail": (
+                f"AF_INET socket. "
+                f"Sender IP: {sender_ip or 'unknown'}. "
+                f"Receiver IP: {receiver_ip or 'unknown'}. "
+                "Routing is handled by the OS; xdrop does not observe IP headers."
+            ),
+        },
+        {
+            "layer": "Link",
+            "protocol": "Wi-Fi / Ethernet (inferred)",
+            "observed": False,
+            "detail": (
+                "The physical interface is selected by the operating system. "
+                "xdrop does not observe link-layer frames, MAC addresses, or MTU. "
+                "No raw packet capture is performed."
+            ),
+        },
+        {
+            "layer": "Discovery",
+            "protocol": "mDNS / zeroconf",
+            "observed": True,
+            "detail": (
+                "Devices are found via _xdrop._tcp.local. mDNS advertisements "
+                "(zeroconf library). mDNS carries only device name and port; "
+                "the actual file data travels over the direct TCP connection above."
+            ),
+        },
+    ]
+
+
 def _transfer_data(transfer: IncomingTransfer) -> dict:
     return {
         "id": transfer.id,
@@ -185,6 +270,10 @@ def _transfer_data(transfer: IncomingTransfer) -> dict:
         "throughput_bps": transfer.speed_bps if transfer.status == "done" else None,
         "resumed_bytes": transfer.resume_offset,
         "started_at": transfer.started_at,
+        # Network endpoint metadata
+        "local_port": transfer.local_port,
+        "peer_port": transfer.peer_port,
+        "finished_sha256": transfer.finished_sha256,
     }
 
 
@@ -207,6 +296,7 @@ class Dashboard:
         self.cancel_events: Dict[str, threading.Event] = {}
         self.quality: Dict[str, dict] = {}
         self.protocol_telemetry: Dict[str, ProtocolRecorder] = {}
+        self.outgoing_events: Dict[str, list] = {}  # transfer_id -> List[TransferEvent]
         self.lock = threading.Lock()
 
     def state(self) -> dict:
@@ -297,9 +387,11 @@ class Dashboard:
 
     def _start_outgoing(self, item: dict) -> None:
         cancel_event = threading.Event()
+        event_list: list = []
         with self.lock:
             self.cancel_events[item["id"]] = cancel_event
             telemetry = self.protocol_telemetry.setdefault(item["id"], ProtocolRecorder())
+            self.outgoing_events[item["id"]] = event_list
         def worker() -> None:
             progress_started = None
             progress_last_at = None
@@ -325,6 +417,7 @@ class Dashboard:
                     self.config.device_name, progress=progress,
                     cancel_event=cancel_event, display_filename=item["filename"],
                     frame_observer=telemetry.record,
+                    event_log=event_list,
                 )
                 with self.lock:
                     item["status"] = "done" if result.get("ok") else (
@@ -340,6 +433,9 @@ class Dashboard:
                     )
                     if duration and item["throughput_bps"] is not None:
                         item["speed_bps"] = item["throughput_bps"]
+                    # Store network endpoint info from result
+                    item["src_port"] = result.get("src_port", 0)
+                    item["sha256"] = result.get("sha256")
                     if result.get("ok") and not item.get("_delivery_group"):
                         try:
                             Path(item["_source_path"]).unlink(missing_ok=True)
@@ -380,6 +476,7 @@ class Dashboard:
                     except OSError:
                         pass
                     self.protocol_telemetry.pop(item["id"], None)
+                    self.outgoing_events.pop(item["id"], None)
             self.outgoing = [item for item in self.outgoing if item.get("status") not in terminal]
             for transfer_id in list(self.cancel_events):
                 if not any(item["id"] == transfer_id for item in self.outgoing):
@@ -394,6 +491,144 @@ class Dashboard:
             subprocess.Popen(["open", str(folder)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             subprocess.Popen(["xdg-open", str(folder)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def get_analyzer_data(self, transfer_id: str, event_offset: int = 0, event_limit: int = 100) -> dict:
+        """Build the full analyzer payload for a given transfer ID.
+
+        Searches both incoming and outgoing transfers. Returns a structured
+        dict suitable for the /api/analyzer/<id> endpoint.
+        """
+        local_ip = self.discovery.local_ip or _primary_ipv4()
+
+        # --- Try incoming first ---
+        incoming_match = next(
+            (t for t in self.receiver.history() if t.id == transfer_id), None
+        )
+        if incoming_match:
+            t = incoming_match
+            events, total_events = t.events_snapshot(event_offset, event_limit)
+            duration = t.duration_s
+            throughput = (
+                max(0, t.received - t.resume_offset) / duration
+                if duration and duration > 0 else None
+            )
+            sender_ip = t.sender_addr.split(":")[0] if ":" in t.sender_addr else t.sender_addr
+            chunks_received = max(0, t.received - t.resume_offset) // CHUNK_SIZE if t.received else 0
+            return {
+                "id": t.id,
+                "direction": "incoming",
+                "overview": {
+                    "filename": t.filename,
+                    "size": t.size,
+                    "sender": t.sender_name,
+                    "receiver": self.config.device_name,
+                    "sender_ip": sender_ip,
+                    "receiver_ip": local_ip,
+                    "sender_port": t.peer_port,
+                    "receiver_port": t.local_port,
+                    "started_at": t.started_at,
+                    "finished_at": t.finished_at,
+                    "duration_s": duration,
+                    "status": t.status,
+                    "direction": "receive",
+                    "bytes_received": t.received,
+                    "resume_offset": t.resume_offset,
+                    "throughput_bps": throughput,
+                    "chunks_received": chunks_received,
+                    "verified": t.verified,
+                    "sha256": t.finished_sha256,
+                    "error": t.error,
+                },
+                "events": events,
+                "events_total": total_events,
+                "events_offset": event_offset,
+                "events_limit": event_limit,
+                "protocol_stack": _build_protocol_stack(
+                    sender_ip=sender_ip, receiver_ip=local_ip,
+                    sender_port=t.peer_port, receiver_port=t.local_port,
+                    direction="incoming",
+                ),
+                "network": {
+                    "local_ip": local_ip,
+                    "remote_ip": sender_ip,
+                    "local_port": t.local_port,
+                    "remote_port": t.peer_port,
+                    "same_subnet": _same_subnet(local_ip, sender_ip),
+                },
+            }
+
+        # --- Try outgoing ---
+        with self.lock:
+            outgoing_match = next(
+                (item for item in self.outgoing if item["id"] == transfer_id), None
+            )
+            recorder = self.protocol_telemetry.get(transfer_id)
+            event_list = self.outgoing_events.get(transfer_id, [])
+        if outgoing_match:
+            item = outgoing_match
+            raw_events = event_list[event_offset: event_offset + event_limit]
+            events = [
+                e.as_dict() if hasattr(e, "as_dict") else e
+                for e in raw_events
+            ]
+            total_events = len(event_list)
+            peer_ip = item.get("peer", "")
+            src_port = item.get("src_port", 0)
+            dst_port = item.get("port", 0)
+            duration = item.get("duration_s")
+            sent = item.get("sent", 0)
+            size = item.get("size", 0)
+            resumed = item.get("resumed_bytes", 0)
+            throughput = item.get("throughput_bps")
+            telemetry = recorder.snapshot() if recorder else {
+                "totals": {}, "by_type": [], "chunk_sizes": [], "recent_records": [], "sample_limit": 0,
+            }
+            chunks_sent = telemetry.get("totals", {}).get("records", 0)
+            return {
+                "id": transfer_id,
+                "direction": "outgoing",
+                "overview": {
+                    "filename": item.get("filename"),
+                    "size": size,
+                    "sender": self.config.device_name,
+                    "receiver": item.get("peer", ""),
+                    "sender_ip": local_ip,
+                    "receiver_ip": peer_ip,
+                    "sender_port": src_port,
+                    "receiver_port": dst_port,
+                    "started_at": item.get("started_at"),
+                    "finished_at": None,
+                    "duration_s": duration,
+                    "status": item.get("status"),
+                    "direction": "send",
+                    "bytes_sent": sent,
+                    "resume_offset": resumed,
+                    "throughput_bps": throughput,
+                    "chunks_sent": chunks_sent,
+                    "verified": item.get("sha256") is not None,
+                    "sha256": item.get("sha256"),
+                    "error": item.get("error"),
+                },
+                "events": events,
+                "events_total": total_events,
+                "events_offset": event_offset,
+                "events_limit": event_limit,
+                "protocol_stack": _build_protocol_stack(
+                    sender_ip=local_ip, receiver_ip=peer_ip,
+                    sender_port=src_port, receiver_port=dst_port,
+                    direction="outgoing",
+                ),
+                "network": {
+                    "local_ip": local_ip,
+                    "remote_ip": peer_ip,
+                    "local_port": src_port,
+                    "remote_port": dst_port,
+                    "same_subnet": _same_subnet(local_ip, peer_ip),
+                },
+                "telemetry": telemetry,
+            }
+
+        return {}  # Not found
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -444,54 +679,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         return not origin or origin.startswith("http://localhost:") or origin.startswith("http://127.0.0.1:")
 
-    def do_GET(self) -> None:
-        if not self._local_request():
-            self._json(403, {"error": "Local dashboard requests only"})
-            return
-        path = urlsplit(self.path).path
-        if path == "/api/pairing.svg":
-            dashboard = self.server.dashboard
-            if not HAS_QR:
-                self._json(503, {"error": "QR support is missing. Install the project dependencies with pip install -e ."})
-                return
-            address = dashboard.discovery.local_ip or _primary_ipv4()
-            if not address:
-                self._json(503, {"error": "No local network address was detected"})
-                return
-            qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, border=0)
-            qr.add_data(f"{address}:{dashboard.receiver.port}")
-            qr.make(fit=True)
-            matrix = qr.get_matrix()
-            quiet_zone = 4
-            side = len(matrix) + quiet_zone * 2
-            path = "".join(
-                f"M{x + quiet_zone},{y + quiet_zone}h1v1h-1z"
-                for y, row in enumerate(matrix)
-                for x, dark in enumerate(row)
-                if dark
-            )
-            svg = (
-                f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {side} {side}" '
-                f'shape-rendering="crispEdges"><rect width="100%" height="100%" fill="#fff"/>'
-                f'<path fill="#20271e" d="{path}"/></svg>'
-            ).encode("utf-8")
-            self._send(200, svg, "image/svg+xml; charset=utf-8")
-            return
-        if path == "/api/state":
-            self._json(200, self.server.dashboard.state())
-            return
-        assets = {"/": "index.html", "/style.css": "style.css", "/app.js": "app.js"}
-        filename = assets.get(path)
-        if filename:
-            content_type = "text/html; charset=utf-8" if filename.endswith("html") else (
-                "text/css; charset=utf-8" if filename.endswith("css") else "text/javascript; charset=utf-8"
-            )
-            try:
-                self._send(200, (WEB_DIR / filename).read_bytes(), content_type)
-            except OSError:
-                self._json(404, {"error": "Dashboard asset not found"})
-            return
-        self._json(404, {"error": "Not found"})
+
 
     def do_POST(self) -> None:
         if not self._local_request():
@@ -546,24 +734,43 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 peer = parse_peer_endpoint(endpoint, 0)
                 if not peer:
                     raise ValueError("Enter a valid peer address and port")
+                # Accept both incoming and outgoing transfers; check endpoint matches
+                peer_ip = peer.address
+                peer_port_num = peer.port
+                transfer_summary: dict = {}
+                recorder = None
                 with dashboard.lock:
-                    transfer = next((item for item in dashboard.outgoing if item["id"] == transfer_id), None)
-                    if not transfer or transfer.get("status") != "done":
-                        raise ValueError("Protocol analysis is available after a successful outgoing transfer")
-                    if transfer.get("peer") != peer.address or int(transfer.get("port", 0)) != peer.port:
-                        raise ValueError("The route target does not match the selected transfer")
-                    recorder = dashboard.protocol_telemetry.get(transfer_id)
-                    transfer_summary = {
-                        "filename": transfer.get("filename"),
-                        "size_bytes": transfer.get("size", 0),
-                        "duration_s": transfer.get("duration_s"),
-                    }
+                    out_item = next((item for item in dashboard.outgoing if item["id"] == transfer_id), None)
+                    if out_item:
+                        if out_item.get("peer") != peer_ip or int(out_item.get("port", 0)) != peer_port_num:
+                            raise ValueError("The route target does not match the selected transfer")
+                        recorder = dashboard.protocol_telemetry.get(transfer_id)
+                        transfer_summary = {
+                            "filename": out_item.get("filename"),
+                            "size_bytes": out_item.get("size", 0),
+                            "duration_s": out_item.get("duration_s"),
+                        }
+                if not out_item:
+                    in_item = next(
+                        (t for t in dashboard.receiver.history() if t.id == transfer_id), None
+                    )
+                    if in_item:
+                        sender_ip = in_item.sender_addr.split(":")[0] if ":" in in_item.sender_addr else in_item.sender_addr
+                        if sender_ip != peer_ip:
+                            raise ValueError("The route target does not match the selected transfer")
+                        transfer_summary = {
+                            "filename": in_item.filename,
+                            "size_bytes": in_item.size,
+                            "duration_s": in_item.duration_s,
+                        }
+                    elif transfer_id:
+                        raise ValueError("Transfer not found")
                 telemetry = recorder.snapshot() if recorder else {
                     "totals": {}, "by_type": [], "chunk_sizes": [], "recent_records": [], "sample_limit": 0,
                 }
-                trace = _trace_route(peer.address)
+                trace = _trace_route(peer_ip)
                 trace.update({
-                    "port": peer.port,
+                    "port": peer_port_num,
                     "local_ip": dashboard.discovery.local_ip or _primary_ipv4(),
                     "note": "These are separate system traceroute probes run now. They do not capture the file transfer; firewalls may hide some hops.",
                     "transfer": transfer_summary,
@@ -625,7 +832,43 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True})
                 return
 
+            if parsed.path == "/api/network-diag":
+                body = self._read_json()
+                endpoint = str(body.get("endpoint", "")).strip()
+                peer = parse_peer_endpoint(endpoint, 0)
+                if not peer:
+                    raise ValueError("Enter a valid peer address and port")
+                local_ip = dashboard.discovery.local_ip or _primary_ipv4()
+                same_subnet = _same_subnet(local_ip, peer.address)
+                probe_ms: Optional[float] = None
+                probe_error: Optional[str] = None
+                try:
+                    probe_ms = probe_peer(peer.address, peer.port, timeout=5.0)
+                except Exception as exc:
+                    probe_error = str(exc)
+                self._json(200, {
+                    "local_ip": local_ip,
+                    "remote_ip": peer.address,
+                    "remote_port": peer.port,
+                    "same_subnet": same_subnet,
+                    "same_subnet_note": (
+                        "Appears to be on the same /24 subnet (local-area network)"
+                        if same_subnet is True
+                        else ("Different subnet or cannot determine"
+                              if same_subnet is False else "Subnet comparison unavailable")
+                    ),
+                    "probe_ms": probe_ms,
+                    "probe_error": probe_error,
+                    "note": (
+                        "probe_ms includes TCP connect, X25519 handshake, and an encrypted round-trip. "
+                        "same_subnet is inferred from the /24 prefix and may be incorrect for non-standard topologies. "
+                        "No packet capture is performed."
+                    ),
+                })
+                return
+
             if parsed.path == "/api/send":
+
                 query = parse_qs(parsed.query)
                 mode = query.get("mode", ["unicast"])[0]
                 if mode not in {"unicast", "multicast", "broadcast"}:
@@ -704,6 +947,77 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(404, {"error": "Not found"})
         except (ValueError, OSError, json.JSONDecodeError, ConnectionError) as exc:
             self._json(400, {"error": str(exc)})
+
+    def do_GET(self) -> None:
+        if not self._local_request():
+            self._json(403, {"error": "Local dashboard requests only"})
+            return
+        path = urlsplit(self.path).path
+        qs = parse_qs(urlsplit(self.path).query)
+        dashboard = self.server.dashboard
+
+        if path == "/api/pairing.svg":
+            if not HAS_QR:
+                self._json(503, {"error": "QR support is missing. Install the project dependencies with pip install -e ."})
+                return
+            address = dashboard.discovery.local_ip or _primary_ipv4()
+            if not address:
+                self._json(503, {"error": "No local network address was detected"})
+                return
+            qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, border=0)
+            qr.add_data(f"{address}:{dashboard.receiver.port}")
+            qr.make(fit=True)
+            matrix = qr.get_matrix()
+            quiet_zone = 4
+            side = len(matrix) + quiet_zone * 2
+            path_svg = "".join(
+                f"M{x + quiet_zone},{y + quiet_zone}h1v1h-1z"
+                for y, row in enumerate(matrix)
+                for x, dark in enumerate(row)
+                if dark
+            )
+            svg = (
+                f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {side} {side}" '
+                f'shape-rendering="crispEdges"><rect width="100%" height="100%" fill="#fff"/>'
+                f'<path fill="#20271e" d="{path_svg}"/></svg>'
+            ).encode("utf-8")
+            self._send(200, svg, "image/svg+xml; charset=utf-8")
+            return
+        if path == "/api/state":
+            self._json(200, dashboard.state())
+            return
+
+        # Transfer analyzer endpoint: GET /api/analyzer/<transfer_id>
+        analyzer_prefix = "/api/analyzer/"
+        if path.startswith(analyzer_prefix):
+            transfer_id = path[len(analyzer_prefix):].strip("/")
+            if not transfer_id:
+                self._json(400, {"error": "Transfer ID is required"})
+                return
+            try:
+                offset = int(qs.get("offset", ["0"])[0])
+                limit = max(1, min(500, int(qs.get("limit", ["100"])[0])))
+            except (ValueError, TypeError):
+                offset, limit = 0, 100
+            data = dashboard.get_analyzer_data(transfer_id, offset, limit)
+            if not data:
+                self._json(404, {"error": f"Transfer '{transfer_id}' not found"})
+                return
+            self._json(200, data)
+            return
+
+        assets = {"/": "index.html", "/style.css": "style.css", "/app.js": "app.js"}
+        filename = assets.get(path)
+        if filename:
+            content_type = "text/html; charset=utf-8" if filename.endswith("html") else (
+                "text/css; charset=utf-8" if filename.endswith("css") else "text/javascript; charset=utf-8"
+            )
+            try:
+                self._send(200, (WEB_DIR / filename).read_bytes(), content_type)
+            except OSError:
+                self._json(404, {"error": "Dashboard asset not found"})
+            return
+        self._json(404, {"error": "Not found"})
 
 
 def main() -> None:
